@@ -11,6 +11,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(nlohmann_json REQUIRED)
 
 add_executable(sync-tool
+    abx.cpp
     main.cpp
     sync.cpp
     watcher.cpp

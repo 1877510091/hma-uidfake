@@ -3,11 +3,13 @@
 
 #include <sys/stat.h>
 
-#include <array>
-#include <cstring>
+#include <algorithm>
+#include <cstdio>
+#include <fstream>
 #include <set>
-#include <string_view>
-#include <vector>
+#include <sstream>
+#include <string>
+#include <utility>
 
 #include "common.hpp"
 #include "hma.hpp"
@@ -16,6 +18,8 @@
 namespace uidfake {
 namespace {
 
+/* /data/user/0/<pkg> is a bind mount of /data/data/<pkg>; an old ROM or a
+ * plain adb shell may only have the second one. */
 constexpr std::string_view kDataUserPrefix = "/data/user/0/";
 constexpr std::string_view kDataDataPrefix = "/data/data/";
 
@@ -34,70 +38,17 @@ std::filesystem::path resolve_config_path(const std::filesystem::path &path) {
   return path;
 }
 
-/*
- * The apk files of one app. The kernel compares their inodes, so what is
- * collected here is exactly that: nothing but numbers, and only for the apps
- * that have rules.
- */
-constexpr std::array<std::string_view, 6> kApkRoots = {
-    "/data/app",       "/system/app",  "/system/priv-app",
-    "/system_ext/app", "/product/app", "/vendor/app"};
-constexpr std::size_t kApkLimit = 1024; /* the kernel takes the same number */
+/* Where installed code lives; the same root the watcher reports events from. */
+constexpr std::string_view kAppRoot = "/data/app";
+/* The kernel takes this many caller code dirs. */
+constexpr std::size_t kApkLimit = 1024;
 
-bool dir_matches(std::string_view name, std::string_view pkg) {
-  if (name == pkg)
-    return true;
-  return name.size() > pkg.size() && name.compare(0, pkg.size(), pkg) == 0 &&
-         name[pkg.size()] == '-';
-}
-
-/*
- * One entry per app: the directory its code lives in. That directory always
- * exists, whatever dexopt left behind, and the kernel matches it by inode while
- * walking up from any file the app opens -- so the apk, a vdex, an odex or a
- * library inside it all name the same app without any of them having to be
- * listed.
- */
-void collect_app_dir(const std::filesystem::path &dir, std::uint32_t uid,
-                     std::vector<ApkEntry> &out) {
-  struct stat info{};
-  if (::stat(dir.c_str(), &info) != 0)
-    return;
-  if (out.size() >= kApkLimit)
-    return;
-  static std::size_t logged;
-  if (logged < 12) {
-    logged++;
-    Log::info("app dir {} dev {} ino {} uid {}", dir.string(),
-              static_cast<std::uint32_t>(info.st_dev),
-              static_cast<std::uint64_t>(info.st_ino), uid);
-  }
-  out.push_back(ApkEntry{.dev = static_cast<std::uint32_t>(info.st_dev),
-                         .ino = static_cast<std::uint64_t>(info.st_ino),
-                         .uid = uid});
-}
-
-/* /data/app holds the app dir one level deeper than the system roots do. */
-void find_app_dir(const std::filesystem::path &base, std::string_view pkg,
-                  std::uint32_t uid, std::vector<ApkEntry> &out, int depth) {
-  std::error_code ec;
-  for (const auto &entry : std::filesystem::directory_iterator{base, ec}) {
-    if (ec)
-      return;
-    if (!entry.is_directory(ec))
-      continue;
-    if (dir_matches(entry.path().filename().string(), pkg)) {
-      collect_app_dir(entry.path(), uid, out);
-    } else if (depth > 0) {
-      find_app_dir(entry.path(), pkg, uid, out, depth - 1);
-    }
-  }
-}
-
-void collect_app_apks(std::string_view pkg, std::uint32_t uid,
-                      std::vector<ApkEntry> &out) {
-  for (const auto root : kApkRoots)
-    find_app_dir(root, pkg, uid, out, 1);
+/* "<package>-<random suffix>": the entry that names a package inside an install
+ * directory. The suffix is base64 and may contain "-" itself, so the caller's
+ * name is matched as a prefix rather than by splitting the string. */
+[[nodiscard]] bool dir_matches(std::string_view leaf, std::string_view pkg) {
+  return leaf.size() > pkg.size() && leaf.compare(0, pkg.size(), pkg) == 0 &&
+         leaf[pkg.size()] == '-';
 }
 
 } // namespace
@@ -111,12 +62,12 @@ std::optional<Config> parse_args(int argc, char **argv) {
       config.once = true;
     } else if (arg == "--config" && has_value) {
       config.config = argv[++i];
-    } else if (arg == "--list" && has_value) {
-      config.packages_list = argv[++i];
+    } else if (arg == "--xml" && has_value) {
+      config.packages_xml = argv[++i];
     } else {
       std::fprintf(
           stderr,
-          "usage: %s [--once] [--config <json>] [--list <packages.list>]\n",
+          "usage: %s [--once] [--config <json>] [--xml <packages.xml>]\n",
           argc > 0 ? argv[0] : "sync-tool");
       return std::nullopt;
     }
@@ -141,10 +92,10 @@ void Syncer::sync_now() {
     Log::info("{} is readable again", config_.config.string());
   }
 
-  const auto packages = PackageDb::load(config_.packages_list);
+  const auto packages = PackageDb::load(config_.packages_xml);
   if (!packages) {
     Log::warn("cannot read {} (will retry on the next event)",
-              config_.packages_list.string());
+              config_.packages_xml.string());
     return;
   }
 
@@ -155,30 +106,125 @@ void Syncer::sync_now() {
   Log::info("synced {} pair(s)", pairs.size());
 
   /*
-   * Then the code directory of each caller: one inode per app, the directory
-   * that always exists whatever dexopt left behind. An isolated child of such
-   * an app is named as soon as it opens anything inside it. A rule with caller
-   * == 0 applies to anyone, so then every app can be a caller and every
-   * directory is registered.
+   * Which packages are callers. A rule with caller == 0 applies to anyone, so
+   * then every package is one. Names, not only uids: the directory a caller's
+   * code lives in is looked up by name.
    */
-  std::set<std::uint32_t> callers;
+  std::set<std::uint32_t> caller_uids;
   bool wild = false;
   for (const auto &pair : pairs) {
-    if (pair.caller == 0) {
+    if (pair.caller == 0)
       wild = true;
+    else
+      caller_uids.insert(pair.caller);
+  }
+
+  callers_.clear();
+  for (const auto &[name, info] : packages->by_name()) {
+    if (wild || caller_uids.contains(info.uid))
+      callers_.emplace(name, info.uid);
+  }
+
+  /* The code directory comes from the same file, so it is refreshed with every
+   * policy: what the package manager recorded is what the kernel is told. The
+   * /data/app events only keep it fresh between two of these passes. */
+  std::size_t missing = 0;
+  for (const auto &[name, uid] : callers_) {
+    const auto dir = packages->code_dir_of(name);
+    if (!dir) {
+      ++missing;
+      continue;
+    }
+    code_dirs_.insert_or_assign(name, *dir);
+  }
+  if (missing != 0)
+    Log::warn("{} caller(s) have no code directory in {}", missing,
+              config_.packages_xml.string());
+
+  publish_code_dirs();
+}
+
+void Syncer::publish_code_dirs() {
+  std::vector<ApkEntry> entries;
+  entries.reserve(callers_.size());
+  /* One entry per directory, even when several packages share a uid. */
+  std::set<std::pair<std::uint32_t, std::uint64_t>> seen;
+
+  for (const auto &[name, uid] : callers_) {
+    const auto dir = code_dirs_.find(name);
+    if (dir == code_dirs_.end())
+      continue;
+    struct stat info{};
+    if (::stat(dir->second.c_str(), &info) != 0)
+      continue;
+    const auto key = std::pair{static_cast<std::uint32_t>(info.st_dev),
+                               static_cast<std::uint64_t>(info.st_ino)};
+    if (!seen.insert(key).second)
+      continue;
+    if (entries.size() >= kApkLimit)
+      break;
+    entries.push_back(
+        ApkEntry{.dev = key.first, .ino = key.second, .uid = uid});
+  }
+
+  if (!netlink_.push_apks(entries))
+    return;
+  Log::info("registered {} caller code dir(s)", entries.size());
+}
+
+void Syncer::handle_packages(const std::vector<std::string> &dirs) {
+  /* Nothing is known before the first policy arrives, and a policy change reads
+   * the whole map again anyway. */
+  if (callers_.empty())
+    return;
+
+  bool changed = false;
+  for (const auto &name : dirs) {
+    const std::filesystem::path base = std::filesystem::path{kAppRoot} / name;
+    std::error_code ec;
+
+    if (std::filesystem::is_directory(base, ec)) {
+      /*
+       * The directory that just arrived: its entries name the packages that
+       * landed in it. This is the only application directory this program ever
+       * reads, it is the one the event pointed at, and it is read once.
+       */
+      for (const auto &entry : std::filesystem::directory_iterator{base, ec}) {
+        if (ec)
+          break;
+        if (!entry.is_directory(ec))
+          continue;
+        const auto leaf = entry.path().filename().string();
+        const auto caller = std::ranges::find_if(callers_, [&](const auto &c) {
+          return dir_matches(leaf, c.first);
+        });
+        if (caller == callers_.end())
+          continue;
+        Log::info("{} now lives in {}", caller->first, entry.path().string());
+        code_dirs_.insert_or_assign(caller->first, entry.path());
+        changed = true;
+      }
     } else {
-      callers.insert(pair.caller);
+      /*
+       * The install directory is gone (replaced by a new one, or uninstalled).
+       * Forget the packages that lived there; if the new directory has already
+       * been seen, its entry took over, and otherwise the next full sync asks
+       * the package manager again.
+       */
+      for (auto it = code_dirs_.begin(); it != code_dirs_.end();) {
+        if (it->second.parent_path() == base) {
+          Log::info("{} no longer lives in {}", it->first, it->second.string());
+          it = code_dirs_.erase(it);
+          changed = true;
+        } else {
+          ++it;
+        }
+      }
     }
   }
-  std::vector<ApkEntry> apks;
-  for (const auto &[name, uid] : packages->by_name()) {
-    if (!wild && !callers.contains(uid))
-      continue;
-    collect_app_apks(name, uid, apks);
-  }
-  if (!netlink_.push_apks(apks))
-    return;
-  Log::info("registered {} caller code dir(s)", apks.size());
+
+  if (changed)
+    publish_code_dirs();
 }
 
 bool Syncer::run() {
@@ -186,20 +232,23 @@ bool Syncer::run() {
   if (config_.once)
     return true;
 
-  if (!watcher_.open(config_.config, config_.packages_list))
+  if (!watcher_.open(config_.config))
     return false;
   Log::info("watching {}", config_.config.string());
 
   for (;;) {
-    if (!watcher_.wait())
+    const auto tick = watcher_.wait();
+    if (!tick)
       return false;
     /*
-     * Re-arm on every tick, not only on events: before the first unlock none of
-     * the encrypted paths exist, so there are no events to react to and the
-     * watches would otherwise never come back.
+     * A key of the policy may have been written mid-replace, so every event
+     * ends in a full pass; an install, on the other hand, only changes one
+     * directory, and that one is read directly.
      */
-    watcher_.apply_watches();
-    sync_now();
+    if (tick->kind == Watcher::Tick::Kind::Packages)
+      handle_packages(tick->dirs);
+    else
+      sync_now();
   }
 }
 

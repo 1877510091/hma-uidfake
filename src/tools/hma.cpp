@@ -89,7 +89,7 @@ Pairs HmaPolicy::expand(const PackageDb &packages) const {
     if (!caller_uid || *caller_uid < kFirstAppUid)
       continue;
 
-    for (const auto &[target_name, target_uid] : packages.by_name()) {
+    for (const auto &[target_name, target] : packages.by_name()) {
       if (target_name == name)
         continue;
       const bool listed = hidden.contains(target_name);
@@ -97,9 +97,9 @@ Pairs HmaPolicy::expand(const PackageDb &packages) const {
         continue;
       if (exclude_system && packages.is_system(target_name))
         continue;
-      if (target_uid < kFirstAppUid)
+      if (target.uid < kFirstAppUid)
         continue;
-      pairs.push_back(Pair{.caller = *caller_uid, .target = target_uid});
+      pairs.push_back(Pair{.caller = *caller_uid, .target = target.uid});
     }
     ++callers;
   }

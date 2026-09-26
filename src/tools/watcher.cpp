@@ -16,9 +16,6 @@
 namespace uidfake {
 namespace {
 
-/* /data/system is noisy; only packages.* events matter there. */
-constexpr std::string_view kPackagesPrefix = "packages.";
-
 /*
  * Android's own "this user's credential-encrypted storage is open" flag, set
  * after the first unlock. /data/user/0 appears through a vold mount and inotify
@@ -83,10 +80,19 @@ constexpr std::uint32_t kFileEvents =
 constexpr std::uint32_t kDirEvents = IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE |
                                      IN_ATTRIB | IN_DELETE | IN_MOVED_FROM;
 
+/*
+ * Where installed code lives, watched at its first level. An install or an
+ * update renames a "~~[random]" directory in here; nothing deeper is watched,
+ * so dexopt writing into an existing package does not wake us up at all.
+ */
+constexpr std::string_view kAppRoot = "/data/app";
+/* Only the rename in and out matters: creation, removal and both moves. */
+constexpr std::uint32_t kAppDirEvents =
+    IN_CREATE | IN_MOVED_TO | IN_MOVED_FROM | IN_DELETE;
+
 } // namespace
 
-bool Watcher::open(const std::filesystem::path &config,
-                   const std::filesystem::path &packages_list) {
+bool Watcher::open(const std::filesystem::path &config) {
   inotify_.reset(::inotify_init1(IN_CLOEXEC | IN_NONBLOCK));
   if (!inotify_.valid()) {
     Log::warn("inotify_init1: {}", std::strerror(errno));
@@ -109,8 +115,7 @@ bool Watcher::open(const std::filesystem::path &config,
   desired_ = {
       {.path = config, .mask = kFileEvents},
       {.path = config.parent_path(), .mask = kDirEvents},
-      {.path = packages_list, .mask = kFileEvents},
-      {.path = "/data/system", .mask = kDirEvents},
+      {.path = kAppRoot, .mask = kAppDirEvents},
   };
   apply_watches();
 
@@ -216,14 +221,18 @@ bool Watcher::handle_inotify_events() {
       /* A file we could not watch before may exist now, or vice versa. */
       rearm = true;
     }
-    if (event->len > 0 &&
-        !std::string_view{event->name}.starts_with(kPackagesPrefix)) {
-      const bool watches_data_system =
-          std::ranges::any_of(watches_, [&](const Watch &w) {
-            return w.wd == event->wd && w.path == "/data/system";
-          });
-      if (watches_data_system)
-        continue;
+    const bool from_app_root = std::ranges::any_of(
+        watches_, [&](const Watch &w) { return w.wd == event->wd; });
+
+    if (from_app_root) {
+      /* An install directory appeared or went away; hand the name to the
+       * caller, which reads that one directory and nothing else. */
+      if (event->len > 0 && (event->mask & IN_ISDIR)) {
+        std::string_view name{event->name};
+        if (name.starts_with("~~"))
+          app_dirs_.emplace_back(name);
+      }
+      continue;
     }
     interesting = true;
   }
@@ -252,7 +261,7 @@ std::optional<Watcher::Tick> Watcher::wait() {
         continue;
       ce_ = true;
       Log::info("credential storage is open (device unlocked)");
-      return Tick::Resync;
+      return Tick{.kind = Tick::Kind::Resync, .dirs = {}};
     }
 
     /* After the unlock a one second tick doubles as the closure check. */
@@ -267,18 +276,28 @@ std::optional<Watcher::Tick> Watcher::wait() {
       if (!ce_available()) {
         ce_ = false;
         Log::info("credential storage closed");
-        return Tick::Resync;
+        return Tick{.kind = Tick::Kind::Resync, .dirs = {}};
       }
       continue;
     }
-    if (fds[0].revents != 0 && handle_inotify_events())
-      arm_debounce();
+    if (fds[0].revents != 0) {
+      const bool interesting = handle_inotify_events();
+      if (!app_dirs_.empty()) {
+        Tick tick{.kind = Tick::Kind::Packages, .dirs = std::move(app_dirs_)};
+        app_dirs_.clear();
+        return tick;
+      }
+      /* config.json changes go through the debounce: an editor writes it in
+       * several steps and only the settled file is worth reading. */
+      if (interesting)
+        arm_debounce();
+    }
 
     std::uint64_t expirations = 0;
     if (fds[1].revents != 0 &&
         ::read(debounce_.get(), &expirations, sizeof(expirations)) > 0) {
       pending_.reset();
-      return Tick::Debounce;
+      return Tick{.kind = Tick::Kind::Config, .dirs = {}};
     }
     if (fds[2].revents != 0 &&
         ::read(resync_.get(), &expirations, sizeof(expirations)) > 0) {
@@ -289,7 +308,7 @@ std::optional<Watcher::Tick> Watcher::wait() {
           watches_complete() ? kResync.count() : kResyncPending.count();
       next.it_interval.tv_sec = kResync.count();
       ::timerfd_settime(resync_.get(), 0, &next, nullptr);
-      return Tick::Resync;
+      return Tick{.kind = Tick::Kind::Resync, .dirs = {}};
     }
   }
 }

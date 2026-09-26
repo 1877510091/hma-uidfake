@@ -16,9 +16,10 @@ survive a second question asked after changing uid.
 ## Data flow
 
 ```
-/data/user/0/com.tsng.hidemyapplist/files/config.json   HMA's rules
-/data/system/packages.list                              package name -> uid
-        |  fsnotify
+/data/user/0/com.tsng.hidemyapplist/files/config.json   HMA's rules         (watched)
+/data/system/packages.xml                               names, uids, code paths  (read on change)
+/data/app                                               installs, updates    (watched, first level)
+        |  fsnotify, plus one read of the package manager's own database
         v
 sync-tool      the only userspace part: watches, evaluates, pushes
         |  generic netlink, family "kaux"

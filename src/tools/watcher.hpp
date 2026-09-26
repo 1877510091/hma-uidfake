@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "common.hpp"
@@ -12,9 +13,14 @@
 namespace uidfake {
 
 /*
- * fsnotify watches on HMA's config and the package manager files, plus the
- * debounce and periodic-resync timers. Directory events are followed too, so an
- * atomic write-to-temp-then-rename of config.json is caught.
+ * fsnotify watches on HMA's config and on /data/app, plus the debounce and
+ * periodic-resync timers. Directory events are followed too, so an atomic
+ * write-to-temp-then-rename of config.json is caught.
+ *
+ * /data/app is watched at its first level only: an install or an update ends
+ * with "~~[random]" being renamed in there, and that event names the directory
+ * whose contents say which package landed. Watching deeper would mean waking up
+ * for every dexopt write instead.
  *
  * Watches are declared first and armed best effort afterwards: a file that does
  * not exist yet, or that is being replaced while we look, used to be dropped
@@ -24,17 +30,23 @@ namespace uidfake {
  */
 class Watcher {
 public:
-  /* What the caller should do next. */
-  enum class Tick { Debounce, Resync };
+  /* What the caller should do next. Packages carries the "~~" directories that
+   * just appeared or disappeared under /data/app; the rest is a plain resync.
+   */
+  struct Tick {
+    enum class Kind { Config, Packages, Resync };
+
+    Kind kind = Kind::Resync;
+    std::vector<std::string> dirs;
+  };
 
   static constexpr auto kDebounce = std::chrono::milliseconds{400};
   /* A continuous stream of changes must not postpone the sync forever. */
   static constexpr auto kDebounceMax = std::chrono::seconds{2};
   /*
    * Short on purpose: the periodic pass is also what re-arms a watch that could
-   * not be created earlier (config.json appearing later, packages.list
-   * mid-replace) and what retries an upload that failed while the module was
-   * unloaded.
+   * not be created earlier (config.json appearing later) and what retries an
+   * upload that failed while the module was unloaded.
    */
   static constexpr auto kResync = std::chrono::seconds{60};
   /* While some watch is still missing, come back much sooner: this is the retry
@@ -46,8 +58,7 @@ public:
    * this is the size the kernel's own examples use. */
   static constexpr std::size_t kReadBuffer = std::size_t{64} * 1024;
 
-  [[nodiscard]] bool open(const std::filesystem::path &config,
-                          const std::filesystem::path &packages_list);
+  [[nodiscard]] bool open(const std::filesystem::path &config);
 
   /* Blocks until something worth resyncing happens; nullopt if polling broke.
    */
@@ -78,6 +89,8 @@ private:
   Fd resync_;
   std::vector<Watch> watches_; /* what inotify actually gave us */
   std::vector<Watch> desired_; /* what we want, whether or not it exists yet */
+  std::vector<std::string>
+      app_dirs_; /* "~~" directories seen under /data/app */
   std::optional<std::chrono::steady_clock::time_point>
       pending_;     /* burst in progress */
   bool ce_ = false; /* sys.user.0.ce_available as last seen */
