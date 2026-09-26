@@ -153,7 +153,7 @@ src/                  kernel module (hma_uidfake.ko)
     sync.cpp watcher.cpp hma.cpp packages.cpp netlink.cpp
     uidbench.c        side-channel detector, built by hand (see Tests)
 module/               what ends up in the flashable zip
-scripts/              host tests, access-shape model, symbol gate, lint
+scripts/              host tests, access-shape model, symbol gate, format, lint
 .github/workflows/    one build job per KMI, then pack
 CMakeLists.txt        build entry point
 ```
@@ -225,6 +225,7 @@ python3 scripts/lookup_model.py     # addresses and load counts per query
 bash scripts/check-undefined.sh     # every undefined symbol is exported by that KMI
 bash scripts/test-kmi-map.sh        # uname -r -> KMI, and whether the zip carries it
 bash scripts/run-clang-tidy.sh      # both halves, see below
+bash scripts/check-format.sh        # the files clang-format and clang-tidy never look at
 ```
 
 The first two compile the real sources, so they catch what a model cannot see (word sizes, field
@@ -235,7 +236,10 @@ same table kbuild uses.
 Formatting and analysis follow the same split as the code: the module and the test sources use the
 kernel's `.clang-format`, the userspace helper uses LLVM's, and `scripts/run-clang-tidy.sh` analyses
 both halves -- the kernel one with the flags kbuild really compiled with, taken from its `.cmd`
-files.
+files. `scripts/check-format.sh` covers the other half of the tree, the part neither tool reaches:
+the CMake files, the shell scripts, the module template and the workflow, and it runs
+`clang-format --dry-run` over every source file as well, so the two styles above stay applied
+instead of only declared.
 
 `src/tools/uidbench.c` is the side-channel detector and is not part of the build; cross-compile it
 and run it as an app uid that hides:

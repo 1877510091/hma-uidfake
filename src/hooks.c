@@ -396,7 +396,8 @@ static void unpatch_entries(uidfake_syscall_t *table, struct hook_entry *e,
 		return;
 	for (i = 0; i < n; i++) {
 		if (e[i].orig)
-			uidfake_patch_text(&table[e[i].nr], (const void *)&e[i].orig,
+			uidfake_patch_text(&table[e[i].nr],
+					   (const void *)&e[i].orig,
 					   sizeof(uidfake_syscall_t), true);
 		e[i].orig = NULL;
 	}

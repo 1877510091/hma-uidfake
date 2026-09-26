@@ -18,22 +18,22 @@ KOS=("$@")
 
 fail=0
 for ko in "${KOS[@]}"; do
-	kmi=$(basename "$ko" _arm64_hma_uidfake.ko)
-	symvers=/opt/ddk/kdir/$kmi/Module.symvers
-	if [ ! -f "$symvers" ]; then
-		echo "FAIL $kmi: no $symvers"
-		fail=1
-		continue
-	fi
-	syms=$("$NM" -u "$ko" | awk '{print $NF}' | sort -u)
-	bad=0
-	for s in $syms; do
-		if ! awk -v n="$s" '$2 == n { found = 1; exit } END { exit !found }' "$symvers"; then
-			echo "FAIL $kmi: $s is not exported by this kernel"
-			bad=1
-			fail=1
-		fi
-	done
-	[ "$bad" = 0 ] && echo "ok   $kmi: $(echo "$syms" | wc -w) undefined symbol(s), all exported"
+  kmi=$(basename "$ko" _arm64_hma_uidfake.ko)
+  symvers=/opt/ddk/kdir/$kmi/Module.symvers
+  if [ ! -f "$symvers" ]; then
+    echo "FAIL $kmi: no $symvers"
+    fail=1
+    continue
+  fi
+  syms=$("$NM" -u "$ko" | awk '{print $NF}' | sort -u)
+  bad=0
+  for s in $syms; do
+    if ! awk -v n="$s" '$2 == n { found = 1; exit } END { exit !found }' "$symvers"; then
+      echo "FAIL $kmi: $s is not exported by this kernel"
+      bad=1
+      fail=1
+    fi
+  done
+  [ "$bad" = 0 ] && echo "ok   $kmi: $(echo "$syms" | wc -w) undefined symbol(s), all exported"
 done
 exit $fail

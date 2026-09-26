@@ -64,7 +64,8 @@ int uidfake_patch_init(void)
 	g_memstart_addr = (unsigned long *)uidfake_lookup("memstart_addr");
 	if (UF_DEBUG_ON())
 		pr_info("uidfake: init_mm=%px kimage_voffset=%px memstart_addr=%px\n",
-		patch_mm, (void *)g_kimage_voffset, (void *)g_memstart_addr);
+			patch_mm, (void *)g_kimage_voffset,
+			(void *)g_memstart_addr);
 	return patch_mm ? 0 : -ENOENT;
 }
 struct patch_req {
