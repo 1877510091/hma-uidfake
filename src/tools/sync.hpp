@@ -6,6 +6,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "netlink.hpp"
@@ -40,8 +41,10 @@ class Syncer {
 public:
   explicit Syncer(Config config) : config_(std::move(config)) {}
 
-  /* Parses and pushes once; failures are logged, never fatal. */
-  void sync_now();
+  /* Parses and pushes once; failures are logged, never fatal. `why` ends up in
+   * the log line of a pass that changed something, so the log says what woke
+   * it. */
+  void sync_now(std::string_view why = "startup");
 
   /* Syncs once, then keeps following the files until it is killed. */
   [[nodiscard]] bool run();
@@ -60,6 +63,11 @@ private:
    * code lives once it is known. */
   std::map<std::string, std::uint32_t, std::less<>> callers_;
   std::map<std::string, std::filesystem::path, std::less<>> code_dirs_;
+  /* What the kernel has already been told. A pass that would repeat it is not
+   * sent: the same tables arriving again are not a change, and logging them as
+   * one is what made an idle module look busy. */
+  std::vector<Pair> pushed_;
+  std::vector<ApkEntry> published_;
 };
 
 } // namespace uidfake

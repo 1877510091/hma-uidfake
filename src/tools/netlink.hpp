@@ -47,6 +47,8 @@ private:
   static constexpr std::uint16_t kAttrBlob = 1;
   static constexpr std::size_t kReplySize = 4096;
 
+  /* One line per outage, and one when it ends. */
+  void note_reachable();
   [[nodiscard]] bool ensure_connected();
   [[nodiscard]] bool send_once(std::span<const Pair> pairs);
   [[nodiscard]] bool send_apks_once(std::span<const ApkEntry> entries);
@@ -56,6 +58,9 @@ private:
 
   Fd socket_;
   std::optional<std::uint16_t> family_;
+  /* One line per outage, not one per attempt: the syncer retries while the
+   * module is not loaded, and the same warning every ten seconds is noise. */
+  bool warned_ = false;
   std::uint32_t seq_ = 0; /* one per request; replies are matched against it */
 };
 

@@ -174,8 +174,11 @@ std::optional<std::uint16_t> NetlinkClient::resolve_family() {
     header = nlmsg_next(header);
   }
 
-  Log::warn("generic netlink family {} not found (module not loaded?)",
-            kFamilyName);
+  if (!warned_) {
+    warned_ = true;
+    Log::warn("generic netlink family {} not found (module not loaded?)",
+              kFamilyName);
+  }
   return std::nullopt;
 }
 
@@ -211,6 +214,13 @@ bool NetlinkClient::ensure_connected() {
   return true;
 }
 
+void NetlinkClient::note_reachable() {
+  if (!warned_)
+    return;
+  warned_ = false;
+  Log::info("kernel side reachable again");
+}
+
 bool NetlinkClient::push(std::span<const Pair> pairs) {
   /*
    * Two attempts. A failure drops the cached family id together with the
@@ -219,12 +229,17 @@ bool NetlinkClient::push(std::span<const Pair> pairs) {
    * for the rest of its life.
    */
   for (int attempt = 0; attempt < 2; ++attempt) {
-    if (send_once(pairs))
+    if (send_once(pairs)) {
+      note_reachable();
       return true;
+    }
     family_.reset();
     socket_.reset();
   }
-  Log::warn("kernel side unreachable, keeping the previous policy");
+  if (!warned_) {
+    warned_ = true;
+    Log::warn("kernel side unreachable, keeping the previous policy");
+  }
   return false;
 }
 
@@ -275,12 +290,17 @@ bool NetlinkClient::send_once(std::span<const Pair> pairs) {
 
 bool NetlinkClient::push_apks(std::span<const ApkEntry> entries) {
   for (int attempt = 0; attempt < 2; ++attempt) {
-    if (send_apks_once(entries))
+    if (send_apks_once(entries)) {
+      note_reachable();
       return true;
+    }
     family_.reset();
     socket_.reset();
   }
-  Log::warn("kernel side unreachable, caller apk table unchanged");
+  if (!warned_) {
+    warned_ = true;
+    Log::warn("kernel side unreachable, caller apk table unchanged");
+  }
   return false;
 }
 

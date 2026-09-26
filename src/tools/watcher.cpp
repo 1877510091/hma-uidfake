@@ -119,14 +119,26 @@ bool Watcher::open(const std::filesystem::path &config) {
   };
   apply_watches();
 
-  itimerspec timer{};
-  timer.it_value.tv_sec = kResync.count();
-  timer.it_interval.tv_sec = kResync.count();
-  if (::timerfd_settime(resync_.get(), 0, &timer, nullptr) < 0) {
-    Log::warn("timerfd_settime: {}", std::strerror(errno));
-    return false;
-  }
+  /* The directory watch is only there for an atomic replace of the config
+   * itself; the name tells the two apart when events arrive. */
+  config_name_ = config.filename().string();
+  const auto dir = std::ranges::find_if(
+      watches_, [&](const Watch &w) { return w.path == config.parent_path(); });
+  config_dir_wd_ = dir == watches_.end() ? -1 : dir->wd;
+
+  /* Nothing is armed here: a retry is asked for when something is missing. */
+  if (!watches_complete())
+    arm_retry();
   return true;
+}
+
+void Watcher::arm_retry() {
+  if (!resync_.valid())
+    return;
+  itimerspec timer{};
+  timer.it_value.tv_sec = kRetry.count();
+  timer.it_interval.tv_sec = 0; /* one shot; the caller decides what is next */
+  ::timerfd_settime(resync_.get(), 0, &timer, nullptr);
 }
 
 void Watcher::apply_watches() {
@@ -217,6 +229,15 @@ bool Watcher::handle_inotify_events() {
       rearm = true;
       continue;
     }
+    /*
+     * HMA keeps its own files next to config.json, and that directory is only
+     * watched so a config written to a temporary file and renamed into place is
+     * caught. Anything else in there is none of our business: without this,
+     * every file HMA writes wakes the whole sync up.
+     */
+    if (event->len > 0 && event->wd == config_dir_wd_ &&
+        config_name_ != event->name)
+      continue;
     if (event->mask & (IN_CREATE | IN_MOVED_TO | IN_DELETE | IN_MOVED_FROM)) {
       /* A file we could not watch before may exist now, or vice versa. */
       rearm = true;
@@ -260,7 +281,13 @@ std::optional<Watcher::Tick> Watcher::wait() {
       if (!wait_for_unlock())
         continue;
       ce_ = true;
+      /* The mount is there now, so the watches that could not be created
+       * before can be: without this one a change would go unnoticed until
+       * something else happened. */
+      apply_watches();
       Log::info("credential storage is open (device unlocked)");
+      if (!watches_complete())
+        arm_retry();
       return Tick{.kind = Tick::Kind::Resync, .dirs = {}};
     }
 
@@ -301,13 +328,11 @@ std::optional<Watcher::Tick> Watcher::wait() {
     }
     if (fds[2].revents != 0 &&
         ::read(resync_.get(), &expirations, sizeof(expirations)) > 0) {
-      /* Retry sooner while a watch is still missing, so an unlock is picked up
-       * quickly. */
-      itimerspec next{};
-      next.it_value.tv_sec =
-          watches_complete() ? kResync.count() : kResyncPending.count();
-      next.it_interval.tv_sec = kResync.count();
-      ::timerfd_settime(resync_.get(), 0, &next, nullptr);
+      /* A retry fired: try the watches again and let the caller re-evaluate.
+       * It asks for the next retry if something is still pending. */
+      apply_watches();
+      if (!watches_complete())
+        arm_retry();
       return Tick{.kind = Tick::Kind::Resync, .dirs = {}};
     }
   }

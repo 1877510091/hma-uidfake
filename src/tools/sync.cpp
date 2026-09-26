@@ -76,7 +76,7 @@ std::optional<Config> parse_args(int argc, char **argv) {
   return config;
 }
 
-void Syncer::sync_now() {
+void Syncer::sync_now(std::string_view why) {
   const auto policy = HmaPolicy::load(config_.config);
   if (!policy) {
     /* Once per outage: before the unlock this used to repeat on every tick. */
@@ -101,9 +101,19 @@ void Syncer::sync_now() {
 
   const Pairs pairs = policy->expand(*packages);
 
-  if (!netlink_.push(pairs))
-    return;
-  Log::info("synced {} pair(s)", pairs.size());
+  const auto same_pair = [](const Pair &a, const Pair &b) {
+    return a.caller == b.caller && a.target == b.target;
+  };
+  if (!std::ranges::equal(pairs, pushed_, same_pair)) {
+    if (!netlink_.push(pairs)) {
+      /* The kernel keeps its policy, and this pass asks for a retry: a module
+       * loaded a second later would otherwise wait for the next event. */
+      watcher_.arm_retry();
+      return;
+    }
+    pushed_.assign(pairs.begin(), pairs.end());
+    Log::info("synced {} pair(s) ({})", pairs.size(), why);
+  }
 
   /*
    * Which packages are callers. A rule with caller == 0 applies to anyone, so
@@ -167,8 +177,16 @@ void Syncer::publish_code_dirs() {
         ApkEntry{.dev = key.first, .ino = key.second, .uid = uid});
   }
 
-  if (!netlink_.push_apks(entries))
+  const auto same_entry = [](const ApkEntry &a, const ApkEntry &b) {
+    return a.dev == b.dev && a.ino == b.ino && a.uid == b.uid;
+  };
+  if (std::ranges::equal(entries, published_, same_entry))
     return;
+  if (!netlink_.push_apks(entries)) {
+    watcher_.arm_retry();
+    return;
+  }
+  published_.assign(entries.begin(), entries.end());
   Log::info("registered {} caller code dir(s)", entries.size());
 }
 
@@ -248,7 +266,8 @@ bool Syncer::run() {
     if (tick->kind == Watcher::Tick::Kind::Packages)
       handle_packages(tick->dirs);
     else
-      sync_now();
+      sync_now(tick->kind == Watcher::Tick::Kind::Config ? "config.json changed"
+                                                         : "retry");
   }
 }
 

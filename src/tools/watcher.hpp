@@ -44,15 +44,13 @@ public:
   /* A continuous stream of changes must not postpone the sync forever. */
   static constexpr auto kDebounceMax = std::chrono::seconds{2};
   /*
-   * Short on purpose: the periodic pass is also what re-arms a watch that could
-   * not be created earlier (config.json appearing later) and what retries an
-   * upload that failed while the module was unloaded.
+   * One shot, and only while something is known to be pending: a watch that
+   * could not be created yet (config.json after the unlock, which inotify
+   * cannot see either) or an upload that did not reach the kernel (module not
+   * loaded yet). A module that is working has no timer running at all --
+   * config changes and installs arrive as events.
    */
-  static constexpr auto kResync = std::chrono::seconds{60};
-  /* While some watch is still missing, come back much sooner: this is the retry
-   * that picks up /data/user/0 once the device has been unlocked, and inotify
-   * cannot see a mount. */
-  static constexpr auto kResyncPending = std::chrono::seconds{10};
+  static constexpr auto kRetry = std::chrono::seconds{10};
 
   /* One read of the inotify queue: the kernel drops events that do not fit, and
    * this is the size the kernel's own examples use. */
@@ -67,6 +65,9 @@ public:
   /* (Re)arms every watch we want. Cheap and idempotent, so it runs after events
    * too. */
   void apply_watches();
+
+  /* Arms one retry. Called while a watch is missing or a push did not land. */
+  void arm_retry();
 
   /* False while a wanted watch is still missing (typically /data before the
    * first unlock). */
@@ -90,7 +91,9 @@ private:
   std::vector<Watch> watches_; /* what inotify actually gave us */
   std::vector<Watch> desired_; /* what we want, whether or not it exists yet */
   std::vector<std::string>
-      app_dirs_; /* "~~" directories seen under /data/app */
+      app_dirs_;            /* "~~" directories seen under /data/app */
+  std::string config_name_; /* basename of the watched config */
+  int config_dir_wd_ = -1;  /* its directory watch, if it was armed */
   std::optional<std::chrono::steady_clock::time_point>
       pending_;     /* burst in progress */
   bool ce_ = false; /* sys.user.0.ce_available as last seen */
