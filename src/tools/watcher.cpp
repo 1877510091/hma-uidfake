@@ -132,7 +132,7 @@ void Watcher::apply_watches() {
                           .mask = want.kind == RuleSource::Watch::Kind::File
                                       ? kFileEvents
                                       : kDirEvents,
-                          .filter = want.name,
+                          .filter = want.names,
                           .app_root = false,
                           .warned = was_warned(want.path)});
   fresh.push_back(Watch{.path = kAppRoot,
@@ -236,7 +236,9 @@ bool Watcher::handle_inotify_events() {
         watches_, [&](const Watch &w) { return w.wd == event->wd; });
 
     if (watch != watches_.end() && event->len > 0 && !watch->filter.empty() &&
-        !leaf_matches(event->name, watch->filter))
+        !std::ranges::any_of(watch->filter, [&](const std::string &accepted) {
+          return leaf_matches(event->name, accepted);
+        }))
       continue;
     if (event->mask & (IN_CREATE | IN_MOVED_TO | IN_DELETE | IN_MOVED_FROM)) {
       /* A file we could not watch before may exist now, or vice versa. */

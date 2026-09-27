@@ -177,6 +177,12 @@ int main()
 	      "oss: gms is never hidden");
 	check(oss_hides("com.example.caller", "com.android.shell"), false,
 	      "oss: the built-in list is HMA's, not HMA-OSS's");
+	/* A caller never hides itself, and the reserved list wins over the whitelist
+	 * mode that would otherwise hide everything unlisted. */
+	check(oss_hides("com.example.whitelist", "com.example.whitelist"),
+	      false, "oss: a caller never hides itself");
+	check(oss_hides("com.example.whitelist", "com.miui.securitycenter"),
+	      false, "oss: the reserved list wins in whitelist mode");
 
 	std::filesystem::remove(hma_path);
 	std::filesystem::remove(oss_path);

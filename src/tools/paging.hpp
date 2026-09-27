@@ -14,6 +14,13 @@ namespace uidfake {
  * pins down against an independent value. */
 [[nodiscard]] std::uint32_t crc32(std::span<const Pair> pairs);
 
+/* The three messages a policy upload is made of, byte for byte as src/netlink.c
+ * reads them. */
+[[nodiscard]] std::vector<std::byte> begin_payload(std::uint32_t total,
+                                                   std::uint32_t crc);
+[[nodiscard]] std::vector<std::byte> page_payload(std::uint32_t seq,
+                                                  std::span<const Pair> pairs);
+
 /* Pairs per message: the page header is 8 bytes and the kernel takes at most
  * 32 KiB (MAX_BLOB_BYTES). */
 inline constexpr std::size_t kPagePairs = 4090;

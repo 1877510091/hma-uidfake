@@ -14,6 +14,18 @@ int main(int argc, char **argv) {
       return 2;
 
     uidfake::Syncer syncer(*config);
+    if (config->make_template) {
+      syncer.template_for(*config->make_template, config->write_config);
+      return 0;
+    }
+    if (config->list) {
+      syncer.list_targets(*config->list);
+      return 0;
+    }
+    if (config->explain) {
+      syncer.explain(config->explain->first, config->explain->second);
+      return 0;
+    }
     return syncer.run() ? 0 : 1;
   } catch (const std::exception &e) {
     std::fprintf(stderr, "sync-tool: %s\n", e.what());

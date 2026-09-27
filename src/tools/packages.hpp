@@ -8,6 +8,9 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <vector>
+
+#include "common.hpp"
 
 namespace uidfake {
 
@@ -48,5 +51,13 @@ public:
 private:
   std::map<std::string, PackageInfo, std::less<>> by_name_;
 };
+
+/* HMA's rules are per package, not per user: an app hidden from another is
+ * hidden in every user, and uid(user) = uid(user 0) + user * 100000. */
+[[nodiscard]] std::vector<std::uint32_t> android_users();
+[[nodiscard]] Pairs expand_users(const Pairs &pairs,
+                                 const std::vector<std::uint32_t> &users);
+
+inline constexpr std::uint32_t kUserSpan = 100000;
 
 } // namespace uidfake

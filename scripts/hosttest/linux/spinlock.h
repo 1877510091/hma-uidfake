@@ -24,4 +24,6 @@ typedef struct {
 		(void)(l);           \
 		(void)(f);           \
 	} while (0)
+#include "atomic.h"
+
 #endif

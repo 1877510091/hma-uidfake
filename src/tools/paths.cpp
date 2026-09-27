@@ -106,40 +106,43 @@ std::vector<RuleSource::Watch> RuleSource::watches() const {
   std::vector<Watch> watches;
   std::error_code ignored;
   const auto dir = pattern_.parent_path();
-  const auto name = pattern_.filename().string();
 
-  const auto watch_file = [&](const std::filesystem::path &file) {
-    watches.push_back(Watch{.path = file.parent_path(),
-                            .kind = Watch::Kind::Directory,
-                            .name = name});
+  /*
+   * The data the app keeps beside its config. The presets a caller applies are
+   * expanded into that cache, and the cache is written after the config that
+   * names them, so a change to it has to wake the sync up on its own.
+   */
+  const std::vector<std::string> names{pattern_.filename().string(),
+                                       std::string{kPresetCacheNew},
+                                       std::string{kPresetCacheOld}};
+
+  const auto watch_dir = [&](const std::filesystem::path &watched) {
     watches.push_back(
-        Watch{.path = file, .kind = Watch::Kind::File, .name = {}});
+        Watch{.path = watched, .kind = Watch::Kind::Directory, .names = names});
+    for (const auto &name : names) {
+      const auto file = watched / name;
+      if (std::filesystem::exists(file, ignored))
+        watches.push_back(
+            Watch{.path = file, .kind = Watch::Kind::File, .names = {}});
+    }
   };
 
   if (!has_glob(dir.filename().string())) {
-    const auto file = resolve_user_prefix(pattern_);
-    if (std::filesystem::exists(file, ignored))
-      watch_file(file);
-    else
-      watches.push_back(Watch{.path = dir, .name = name});
+    watch_dir(resolve_user_prefix(pattern_).parent_path());
     return watches;
   }
 
   const auto matches = match_dirs(dir);
   if (matches.empty()) {
     /* Nothing there yet: watch where the data directory will appear. */
-    watches.push_back(
-        Watch{.path = dir.parent_path(), .name = dir.filename().string()});
+    watches.push_back(Watch{.path = dir.parent_path(),
+                            .kind = Watch::Kind::Directory,
+                            .names = {dir.filename().string()}});
     return watches;
   }
 
-  for (const auto &match : matches) {
-    const auto file = match / pattern_.filename();
-    if (std::filesystem::exists(file, ignored))
-      watch_file(file);
-    else
-      watches.push_back(Watch{.path = match, .name = name});
-  }
+  for (const auto &match : matches)
+    watch_dir(match);
   return watches;
 }
 

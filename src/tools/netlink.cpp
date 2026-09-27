@@ -138,7 +138,7 @@ std::optional<std::uint16_t> NetlinkClient::resolve_family() {
 
   auto *genl = request.genlmsg();
   genl->cmd = CTRL_CMD_GETFAMILY;
-  genl->version = kUapiVersion;
+  genl->version = 1;
 
   auto *attr = reinterpret_cast<nlattr *>(reinterpret_cast<std::byte *>(genl) +
                                           GENL_HDRLEN);
@@ -268,7 +268,7 @@ bool NetlinkClient::send_command(std::uint8_t cmd,
 
   auto *genl = request.genlmsg();
   genl->cmd = cmd;
-  genl->version = 1;
+  genl->version = kUapiVersion;
 
   auto *attr = reinterpret_cast<nlattr *>(reinterpret_cast<std::byte *>(genl) +
                                           GENL_HDRLEN);
@@ -283,23 +283,16 @@ bool NetlinkClient::send_command(std::uint8_t cmd,
 
 bool NetlinkClient::send_paged(std::span<const Pair> pairs) {
   const auto total = static_cast<std::uint32_t>(pairs.size());
-  std::vector<std::byte> begin(12);
-  store_u32(begin, 0, total);
-  store_u32(begin, 4, 2 * total);
-  store_u32(begin, 8, crc32(pairs));
-  if (!send_command(kCmdSetBegin, begin))
+
+  if (!send_command(kCmdSetBegin, begin_payload(total, crc32(pairs))))
     return false;
 
   for (std::size_t sent = 0; sent < pairs.size();) {
     const std::size_t n = std::min(kPagePairs, pairs.size() - sent);
-    std::vector<std::byte> page(8 + 8 * n);
-    store_u32(page, 0, static_cast<std::uint32_t>(sent));
-    store_u32(page, 4, static_cast<std::uint32_t>(n));
-    for (std::size_t i = 0; i < n; ++i) {
-      store_u32(page, 8 + 8 * i, pairs[sent + i].caller);
-      store_u32(page, 12 + 8 * i, pairs[sent + i].target);
-    }
-    if (!send_command(kCmdSetPage, page))
+
+    if (!send_command(kCmdSetPage,
+                      page_payload(static_cast<std::uint32_t>(sent),
+                                   pairs.subspan(sent, n))))
       return false; /* the kernel never saw a commit: the live policy stays */
     sent += n;
   }
@@ -349,7 +342,7 @@ bool NetlinkClient::send_apks_once(std::span<const ApkEntry> entries) {
 
   auto *genl = request.genlmsg();
   genl->cmd = kCmdApk;
-  genl->version = 1;
+  genl->version = kUapiVersion;
 
   auto *attr = reinterpret_cast<nlattr *>(reinterpret_cast<std::byte *>(genl) +
                                           GENL_HDRLEN);

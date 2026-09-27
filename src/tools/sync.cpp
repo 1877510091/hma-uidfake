@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "sync.hpp"
 
+#include "oss_presets.hpp"
+
 #include <sys/stat.h>
 
 #include <algorithm>
@@ -20,12 +22,13 @@ namespace uidfake {
 namespace {
 
 [[nodiscard]] Presets
-load_preset_cache(const std::filesystem::path &config_file) {
+load_preset_cache(const std::filesystem::path &config_file,
+                  PresetFacts &facts) {
   Presets presets;
   std::error_code ignored;
-  auto cache = config_file.parent_path() / "preset_cache_v2.json";
+  auto cache = config_file.parent_path() / kPresetCacheNew;
   if (!std::filesystem::exists(cache, ignored))
-    cache = config_file.parent_path() / "preset_cache.json";
+    cache = config_file.parent_path() / kPresetCacheOld;
 
   nlohmann::json json;
   try {
@@ -47,6 +50,13 @@ load_preset_cache(const std::filesystem::path &config_file) {
       if (item.is_string())
         packages.insert(item.get<std::string>());
   }
+
+  /* The same cache says which packages are connected to GMS: a preset hit still
+   * leaves those visible to a caller that asks as one of the GMS packages. */
+  for (const auto &item :
+       json.value("riskyPackageCache", nlohmann::json::array()))
+    if (item.is_string())
+      facts.gms_connected.insert(item.get<std::string>());
   return presets;
 }
 
@@ -68,13 +78,81 @@ std::optional<Config> parse_args(int argc, char **argv) {
     const std::string_view arg = argv[i];
     if (arg == "--once") {
       config.once = true;
+    } else if (arg == "--write-config") {
+      config.write_config = true;
+    } else if (arg == "--template" && i + 1 < argc) {
+      config.make_template = std::string{argv[++i]};
+    } else if (arg == "--list" && i + 1 < argc) {
+      config.list = std::string{argv[++i]};
+    } else if (arg == "--explain" && i + 2 < argc) {
+      config.explain =
+          std::pair{std::string{argv[++i]}, std::string{argv[++i]}};
     } else {
-      std::fprintf(stderr, "usage: %s [--once]\n",
-                   argc > 0 ? argv[0] : "sync-tool");
+      std::fprintf(
+          stderr,
+          "usage: %s [--once] [--explain CALLER TARGET] [--list CALLER] "
+          "[--template CALLER [--write-config]]\n",
+          argc > 0 ? argv[0] : "sync-tool");
       return std::nullopt;
     }
   }
   return config;
+}
+
+const PackageDb *Syncer::packages() {
+  struct stat info{};
+  if (::stat(std::string{kPackagesXml}.c_str(), &info) != 0) {
+    Log::warn("cannot read {} (will retry on the next event)", kPackagesXml);
+    return nullptr;
+  }
+
+  const PackageStamp stamp{.mtime_sec = info.st_mtim.tv_sec,
+                           .mtime_nsec = info.st_mtim.tv_nsec,
+                           .size = (std::uint64_t)info.st_size,
+                           .inode = (std::uint64_t)info.st_ino};
+  const bool cached = packages_ &&
+                      stamp.mtime_sec == packages_stamp_.mtime_sec &&
+                      stamp.mtime_nsec == packages_stamp_.mtime_nsec &&
+                      stamp.size == packages_stamp_.size &&
+                      stamp.inode == packages_stamp_.inode;
+  if (cached)
+    return &*packages_;
+
+  auto db = PackageDb::load(std::string{kPackagesXml});
+  if (!db)
+    return nullptr;
+  Log::info("read {} ({} package(s))", kPackagesXml, db->by_name().size());
+  packages_ = std::move(db);
+  packages_stamp_ = stamp;
+  return &*packages_;
+}
+
+/* One place that reads the source through its rules, with the presets' three
+ * sources: the sync, --explain, --list and --template cannot disagree. */
+std::optional<Syncer::OpenedRules>
+Syncer::open_rules(const std::filesystem::path &file,
+                   const PackageDb &packages) {
+  std::unique_ptr<Rules> rules;
+  const std::optional<RuleSource> source = RuleSource::active(sources_);
+  if (source && source->tool() == Tool::HmaOss)
+    rules = HmaOssRules::load(file);
+  else
+    rules = HmaRules::load(file);
+  if (!rules) {
+    Log::warn("cannot read {}", file.string());
+    return std::nullopt;
+  }
+
+  PresetFacts facts;
+  Presets presets;
+  if (rules->uses_presets()) {
+    presets = load_preset_cache(file, facts);
+    /* The app rebuilds its own presets per process from a view its hooks
+     * filter, so the scanned half is computed here instead. */
+    facts.scanned = scan_presets(packages);
+  }
+  rules->set_preset_facts(std::move(facts));
+  return OpenedRules{.rules = std::move(rules), .presets = std::move(presets)};
 }
 
 void Syncer::sync_now(std::string_view why) {
@@ -92,27 +170,23 @@ void Syncer::sync_now(std::string_view why) {
     Log::info("rule source readable again");
   }
 
-  const auto packages = PackageDb::load(std::string{kPackagesXml});
-  if (!packages) {
-    Log::warn("cannot read {} (will retry on the next event)", kPackagesXml);
+  const PackageDb *packages = this->packages();
+  if (packages == nullptr)
     return;
-  }
-
-  /* The path says which tool the file belongs to, so it says which rules read
-   * it: nothing is guessed from the contents. */
   const auto file = source->config();
   if (!file)
     return; /* it went away between the check and the read */
-  std::unique_ptr<Rules> rules;
-  if (source->tool() == Tool::HmaOss)
-    rules = HmaOssRules::load(*file);
-  else
-    rules = HmaRules::load(*file);
-  if (!rules)
+
+  const auto opened = open_rules(*file, *packages);
+  if (!opened)
     return;
-  const Presets presets =
-      rules->uses_presets() ? load_preset_cache(*file) : Presets{};
+  Rules *rules = opened->rules.get();
+  const Presets &presets = opened->presets;
   Pairs pairs = rules->expand(*packages, presets);
+
+  /* The rules are per package, so every user answers
+   * for its own uids. */
+  pairs = expand_users(pairs, android_users());
   std::ranges::sort(pairs, [](const Pair &a, const Pair &b) {
     return a.caller != b.caller ? a.caller < b.caller : a.target < b.target;
   });
@@ -122,10 +196,12 @@ void Syncer::sync_now(std::string_view why) {
                           }),
               pairs.end());
 
-  /* The kernel holds this many pairs; another attempt cannot change the count.
+  /* The kernel holds this many pairs; another
+   * attempt cannot change the count.
    */
   if (pairs.size() > NetlinkClient::kMaxPairs) {
-    Log::warn("{} pair(s) is more than the kernel holds ({}); keeping the "
+    Log::warn("{} pair(s) is more than the kernel "
+              "holds ({}); keeping the "
               "previous policy",
               pairs.size(), NetlinkClient::kMaxPairs);
     return;
@@ -136,8 +212,10 @@ void Syncer::sync_now(std::string_view why) {
   };
   if (!std::ranges::equal(pairs, pushed_, same_pair)) {
     if (!netlink_.push(pairs)) {
-      /* The kernel keeps its policy, and this pass asks for a retry: a module
-       * loaded a second later would otherwise wait for the next event. */
+      /* The kernel keeps its policy, and this pass
+       * asks for a retry: a module loaded a second
+       * later would otherwise wait for the next
+       * event. */
       watcher_.arm_retry();
       return;
     }
@@ -179,7 +257,8 @@ void Syncer::sync_now(std::string_view why) {
 void Syncer::publish_code_dirs() {
   std::vector<ApkEntry> entries;
   entries.reserve(callers_.size());
-  /* One entry per directory, even when several packages share a uid. */
+  /* One entry per directory, even when several
+   * packages share a uid. */
   std::set<std::pair<std::uint32_t, std::uint64_t>> seen;
 
   for (const auto &[name, uid] : callers_) {
@@ -213,8 +292,9 @@ void Syncer::publish_code_dirs() {
 }
 
 void Syncer::handle_packages(const std::vector<std::string> &dirs) {
-  /* Nothing is known before the first policy arrives, and a policy change reads
-   * the whole map again anyway. */
+  /* Nothing is known before the first policy
+   * arrives, and a policy change reads the whole map
+   * again anyway. */
   if (callers_.empty())
     return;
 
@@ -258,6 +338,188 @@ void Syncer::handle_packages(const std::vector<std::string> &dirs) {
     publish_code_dirs();
 }
 
+/* One decision, printed with everything it was read
+ * from: the per-caller lines the expander writes,
+ * the preset summary, and then the answer. */
+void Syncer::explain(std::string_view caller, std::string_view target) {
+  const std::optional<RuleSource> source = RuleSource::active(sources_);
+  if (!source) {
+    Log::warn("no readable rule source");
+    return;
+  }
+  const PackageDb *packages = this->packages();
+  if (packages == nullptr)
+    return;
+  const auto file = source->config();
+  if (!file)
+    return;
+
+  auto opened = open_rules(*file, *packages);
+  if (!opened)
+    return;
+  Rules *rules = opened->rules.get();
+  const Presets &presets = opened->presets;
+
+  /* The same call the sync makes, so its log lines
+   * are the parse itself. */
+  const Pairs pairs = rules->expand(*packages, presets);
+
+  if (!packages->by_name().contains(target))
+    Log::warn("{} is not in {}", target, kPackagesXml);
+  const bool hidden =
+      rules->hides(caller, target, packages->is_system(target), presets);
+  Log::info("{}: {} hides {} = {} ({} pair(s) in "
+            "the policy)",
+            file->string(), caller, target, hidden ? "yes" : "no",
+            pairs.size());
+}
+
+/* Every target one caller hides, by name: the same
+ * list the kernel is given, printed so it can be
+ * read next to what an app itself sees. */
+void Syncer::list_targets(std::string_view caller) {
+  const std::optional<RuleSource> source = RuleSource::active(sources_);
+  if (!source) {
+    Log::warn("no readable rule source");
+    return;
+  }
+  const PackageDb *packages = this->packages();
+  if (packages == nullptr)
+    return;
+  const auto file = source->config();
+  if (!file)
+    return;
+  auto opened = open_rules(*file, *packages);
+  if (!opened)
+    return;
+  Rules *rules = opened->rules.get();
+  const Presets &presets = opened->presets;
+
+  const Pairs pairs = rules->expand(*packages, presets);
+  /* One uid can carry several package names, and the
+   * kernel hides the uid: list them all, or a target
+   * looks missing when it is the same uid under
+   * another name. */
+  std::map<std::uint32_t, std::vector<std::string>> names_of_uid;
+  for (const auto &[name, info] : packages->by_name())
+    names_of_uid[info.uid].push_back(std::string{name});
+
+  std::vector<std::string> targets;
+  const auto caller_uid = packages->uid_of(caller);
+  if (!caller_uid) {
+    Log::warn("{} is not installed", caller);
+    return;
+  }
+  for (const auto &pair : pairs) {
+    if (pair.caller != *caller_uid)
+      continue;
+    const auto names = names_of_uid.find(pair.target);
+    if (names == names_of_uid.end()) {
+      targets.push_back(std::to_string(pair.target));
+      continue;
+    }
+    std::string joined;
+    for (const auto &name : names->second) {
+      if (!joined.empty())
+        joined += " + ";
+      joined += name;
+    }
+    targets.push_back(std::move(joined));
+  }
+  std::ranges::sort(targets);
+  targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+
+  Log::info("{} hides {} target(s):", caller, targets.size());
+  for (const auto &name : targets)
+    Log::info("  {}", name);
+}
+
+/* The caller's hidden set as a template in the
+ * config language: HMA-OSS reads a template from the
+ * config in every process, while it rebuilds a
+ * preset per process from a view its own hooks
+ * filter. */
+void Syncer::template_for(std::string_view caller, bool write) {
+  const std::optional<RuleSource> source = RuleSource::active(sources_);
+  if (!source) {
+    Log::warn("no readable rule source");
+    return;
+  }
+  const PackageDb *packages = this->packages();
+  if (packages == nullptr)
+    return;
+  const auto file = source->config();
+  if (!file)
+    return;
+  auto opened = open_rules(*file, *packages);
+  if (!opened)
+    return;
+  Rules *rules = opened->rules.get();
+  const Presets &presets = opened->presets;
+
+  const Pairs pairs = rules->expand(*packages, presets);
+  const auto caller_uid = packages->uid_of(caller);
+  if (!caller_uid) {
+    Log::warn("{} is not installed", caller);
+    return;
+  }
+
+  std::vector<std::string> names;
+  for (const auto &pair : pairs) {
+    if (pair.caller != *caller_uid)
+      continue;
+    for (const auto &[name, info] : packages->by_name())
+      if (info.uid == pair.target && !std::ranges::contains(names, name))
+        names.emplace_back(name);
+  }
+  std::ranges::sort(names);
+  names.erase(std::unique(names.begin(), names.end()), names.end());
+
+  const std::string template_name = "uidfake";
+  Log::info("{} hides {} package(s); the template "
+            "'{}' would carry them:",
+            caller, names.size(), template_name);
+  nlohmann::json snippet = {
+      {template_name, {{"appList", names}, {"isWhitelist", false}}}};
+  Log::info("\n{}", snippet.dump(2));
+  Log::info("apply it by adding \"{}\" to {}'s "
+            "applyTemplates",
+            template_name, caller);
+  if (!write)
+    return;
+
+  /* Writing into another app's config: keep a copy,
+   * write beside the file and rename, and only when
+   * something actually changes. */
+  std::ifstream in{*file};
+  nlohmann::json config;
+  try {
+    in >> config;
+  } catch (const std::exception &e) {
+    Log::warn("cannot parse {}: {}", file->string(), e.what());
+    return;
+  }
+  config["templates"][template_name] = {{"appList", names},
+                                        {"isWhitelist", false}};
+  auto &applied = config["scope"][std::string{caller}]["applyTemplates"];
+  if (!applied.is_array())
+    applied = nlohmann::json::array();
+  if (!applied.contains(template_name))
+    applied.push_back(template_name);
+
+  const auto backup = file->string() + ".uidfake.bak";
+  std::error_code ignored;
+  if (!std::filesystem::exists(backup, ignored))
+    std::filesystem::copy_file(*file, backup, ignored);
+  const auto tmp = file->string() + ".uidfake.tmp";
+  {
+    std::ofstream out{tmp, std::ios::trunc};
+    out << config.dump();
+  }
+  std::filesystem::rename(tmp, *file, ignored);
+  Log::info("wrote {} (backup {})", file->string(), backup);
+}
+
 bool Syncer::run() {
   sync_now();
   if (config_.once)
@@ -269,7 +531,8 @@ bool Syncer::run() {
     if (const auto file = active->config())
       Log::info("watching {}", file->string());
   } else {
-    Log::info("no rule config yet (waiting for the known places)");
+    Log::info("no rule config yet (waiting for the "
+              "known places)");
   }
 
   for (;;) {

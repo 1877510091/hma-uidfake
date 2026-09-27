@@ -3,6 +3,7 @@
 
 #include <unistd.h>
 
+#include <compare>
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
@@ -22,6 +23,8 @@ inline constexpr std::uint32_t kFirstAppUid = 10000;
 struct Pair {
   std::uint32_t caller = 0;
   std::uint32_t target = 0;
+
+  auto operator<=>(const Pair &) const = default;
 };
 
 using Pairs = std::vector<Pair>;

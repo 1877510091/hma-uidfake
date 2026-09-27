@@ -37,7 +37,11 @@ bool watched(const std::vector<RuleSource::Watch> &watches,
 	     const fs::path &path, std::string_view name)
 {
 	return std::ranges::any_of(watches, [&](const RuleSource::Watch &w) {
-		return w.path == path && w.name == name;
+		if (w.path != path)
+			return false;
+		/* A file watch has no name filter: it sees events without one. */
+		return name.empty() ? w.names.empty() :
+				      std::ranges::contains(w.names, name);
 	});
 }
 

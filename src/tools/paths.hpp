@@ -20,13 +20,13 @@ enum class Tool { Hma, HmaOss };
 class RuleSource {
 public:
   /* What to watch for one source. A directory watch accepts only entries with
-   * `name`; a file watch sees events without one. */
+   * one of `names`; a file watch sees events without one. */
   struct Watch {
     enum class Kind { Directory, File };
 
     std::filesystem::path path;
     Kind kind = Kind::Directory;
-    std::string name;
+    std::vector<std::string> names;
   };
 
   /* The places both tools use, in the order they are looked for. */
@@ -56,6 +56,10 @@ private:
   std::filesystem::path pattern_;
   Tool tool_;
 };
+
+/* The cache HMA-OSS expands its presets into, beside its config. */
+inline constexpr std::string_view kPresetCacheNew = "preset_cache_v2.json";
+inline constexpr std::string_view kPresetCacheOld = "preset_cache.json";
 
 /* True for a directory entry name matching a leaf with one optional '*'. */
 [[nodiscard]] bool leaf_matches(std::string_view name,

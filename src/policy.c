@@ -29,9 +29,6 @@ extern void security_cred_getsecid(const struct cred *cred, u32 *secid);
 
 #include "uidfake.h"
 
-static DEFINE_SPINLOCK(
-	g_pub_lock); /* serialises publishers, never taken by a query */
-
 /*
  * One immutable policy snapshot behind an RCU pointer: a query reads the
  * pointer once and then only touches that snapshot, so it needs no lock and can
@@ -295,6 +292,50 @@ static int layout_cids(struct layout *l, const u32 *hid, u32 nh)
 	}
 	return 0;
 }
+static u32 probe_for(u32 maxdist)
+{
+	return maxdist ? (maxdist < 2 ? 2 : (maxdist < 4 ? 4 : POLICY_WAY)) : 1;
+}
+
+/*
+ * Place every distinct target the way the real layout will, and report how far
+ * it had to walk. One bit per slot of every line is enough to know.
+ */
+static bool trial_fit(const struct apply_pair *p, u32 n, u8 *used, u32 nlines,
+		      u32 shift, u32 mirror, u32 *maxdist)
+{
+	u32 i, dist = 0;
+
+	memset(used, 0, (size_t)nlines * sizeof(*used));
+	for (i = 0; i < n; i++) {
+		u32 t = p[i].target, k;
+
+		if (i && p[i - 1].target == t)
+			continue;
+		{
+			u32 unit = policy_index_mode(t, mirror, shift) &
+				   (nlines - 1);
+			u32 sub = policy_subslot(t);
+			u8 *line = &used[unit];
+
+			for (k = 0; k < POLICY_WAY; k++) {
+				u32 pos = (sub + k) & (POLICY_WAY - 1);
+
+				if (!(*line & (u8)(1u << pos))) {
+					*line |= (u8)(1u << pos);
+					if (k > dist)
+						dist = k;
+					break;
+				}
+			}
+			if (k == POLICY_WAY)
+				return false;
+		}
+	}
+	*maxdist = dist;
+	return true;
+}
+
 /* target slots and their masks, on the kernel's own bucket lines when it fits
  */
 static int layout_targets(struct layout *l, struct apply_pair *p, u32 n,
@@ -302,10 +343,17 @@ static int layout_targets(struct layout *l, struct apply_pair *p, u32 n,
 {
 	struct uid_pair *tgt;
 	u64 *masks;
+	u8 *used;
 	u32 *cnt;
-	u32 i, j, k, nlines, shift, mirror = 1, nt = 0, maxdist = 0;
+	u32 i, j, k, nlines, shift, mirror, nt = 0, maxdist = 0;
 	size_t last = 0;
 
+	_Static_assert(POLICY_WAY <= 8, "one byte of slots per line");
+
+	/*
+	 * Keep the line count the uid-hash layout needs, then take whichever of
+	 * the two layouts asks for fewer probes on that count.
+	 */
 	cnt = kcalloc(POLICY_MAX_LINES, sizeof(*cnt), GFP_KERNEL);
 	if (!cnt)
 		return -1;
@@ -317,18 +365,41 @@ static int layout_targets(struct layout *l, struct apply_pair *p, u32 n,
 			continue;
 		if (++cnt[policy_index_mode(p[i].target, 1, 0) & (nlines - 1)] >
 		    POLICY_WAY) {
-			mirror = 0;
+			for (nlines = POLICY_MIN_LINES;
+			     nlines < n && nlines < POLICY_MAX_LINES;
+			     nlines <<= 1)
+				;
 			break;
 		}
 	}
-	if (!mirror) {
-		for (nlines = POLICY_MIN_LINES;
-		     nlines < n && nlines < POLICY_MAX_LINES; nlines <<= 1)
-			;
-		pr_warn("uidfake: policy does not fit the uid-hash line layout\n");
-	}
 	kfree(cnt);
-	shift = 32 - ilog2(nlines);
+
+	used = kcalloc(POLICY_MAX_LINES, sizeof(*used), GFP_KERNEL);
+	if (!used)
+		return -1;
+	for (;;) {
+		u32 dist_own = 0, dist_mine = 0;
+		bool fit_own, fit_mine;
+
+		shift = 32 - ilog2(nlines);
+		fit_own = trial_fit(p, n, used, nlines, shift, 1, &dist_own);
+		fit_mine = trial_fit(p, n, used, nlines, shift, 0, &dist_mine);
+		if (fit_own || fit_mine) {
+			mirror = fit_own && (!fit_mine ||
+					     probe_for(dist_own) <=
+						     probe_for(dist_mine)) ?
+					 1 :
+					 0;
+			break;
+		}
+		if (nlines >= POLICY_MAX_LINES) {
+			kfree(used);
+			pr_warn("uidfake: policy fits no line layout\n");
+			return -1;
+		}
+		nlines <<= 1;
+	}
+	kfree(used);
 
 	tgt = kcalloc((size_t)nlines * POLICY_WAY, sizeof(*tgt), GFP_KERNEL);
 	masks = kcalloc((size_t)nlines * POLICY_WAY * l->nmask_words,
@@ -389,9 +460,7 @@ static int layout_targets(struct layout *l, struct apply_pair *p, u32 n,
 	l->shift = shift;
 	l->mirror = mirror;
 	l->ntargets = nt;
-	l->probe = maxdist ?
-			   (maxdist < 2 ? 2 : (maxdist < 4 ? 4 : POLICY_WAY)) :
-			   1;
+	l->probe = probe_for(maxdist);
 	return 0;
 
 fail:
@@ -417,13 +486,8 @@ static void policy_release(struct policy *p)
 static void policy_publish(struct policy *np)
 {
 	struct policy *old;
-	unsigned long flags;
 
-	spin_lock_irqsave(&g_pub_lock, flags);
-	old = rcu_dereference_protected(g_pol, true);
-	rcu_assign_pointer(g_pol, np);
-	spin_unlock_irqrestore(&g_pub_lock, flags);
-
+	old = xchg(&g_pol, np);
 	synchronize_rcu();
 	policy_release(old);
 }

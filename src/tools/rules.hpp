@@ -15,9 +15,13 @@
 #include "paths.hpp"
 
 namespace uidfake {
-
 using Presets =
     std::map<std::string, std::set<std::string, std::less<>>, std::less<>>;
+
+/* preset_rules.cpp: the scanned half of the OSS presets, computed from the
+ * installed packages so the tool does not depend on the app's per-process copy.
+ */
+[[nodiscard]] Presets scan_presets(const PackageDb &packages);
 
 /*
  * The rules of one config file. The two apps share their code and not their
@@ -40,6 +44,20 @@ using Presets =
  * in it -- nothing is built beside it. A device has a thousand packages and
  * every one of them is asked about, so nothing here may parse.
  */
+/* HMA-OSS reads three things besides the config: the packages its preset cache
+ * says are connected to GMS, and the WebView and browser webViewProtection
+ * keeps visible. The tool fills them; the tests leave them empty. */
+struct PresetFacts {
+  std::set<std::string, std::less<>> gms_connected;
+  std::string webview;
+  std::string browser;
+
+  /* The presets' scanned half, computed from the installed packages by this
+   * tool: HMA-OSS rebuilds it per process from a view its own hooks filter, so
+   * the app itself is not a reliable source for it. */
+  Presets scanned;
+};
+
 class Rules {
 public:
   virtual ~Rules() = default;
@@ -57,6 +75,9 @@ public:
   /* Only HMA-OSS has presets, so only it needs the cache read for it. */
   [[nodiscard]] virtual bool uses_presets() const { return false; }
 
+  /* Facts the decision needs that do not live in the config file. */
+  virtual void set_preset_facts(PresetFacts facts) { (void)facts; }
+
   [[nodiscard]] Tool tool() const { return tool_; }
   [[nodiscard]] const std::filesystem::path &path() const { return path_; }
 
@@ -71,6 +92,14 @@ protected:
   [[nodiscard]] const nlohmann::json *
   caller_entry(std::string_view caller) const;
 
+public:
+  /* Probe-only: the entry as the tool itself sees it. */
+  [[nodiscard]] const nlohmann::json *
+  caller_entry_for_probe(std::string_view caller) const {
+    return caller_entry(caller);
+  }
+
+protected:
   /* The template of that name, or nullptr. */
   [[nodiscard]] const nlohmann::json *
   template_entry(std::string_view name) const;
@@ -151,16 +180,35 @@ public:
                            bool target_is_system,
                            const Presets &presets) const override;
   [[nodiscard]] bool uses_presets() const override { return true; }
+  void set_preset_facts(PresetFacts facts) override {
+    facts_ = std::move(facts);
+  }
+
+  /* What one caller's entry was read as, for the log. */
+  [[nodiscard]] std::string describe(const nlohmann::json &entry,
+                                     const Presets &presets) const;
+
+  /* What the presets in use added, and which of them the cache did not have:
+   * a log line alone then answers "did the presets reach the policy?". */
+  void report_presets(const PackageDb &packages, const Presets &presets,
+                      const Pairs &pairs) const;
 
 private:
-  [[nodiscard]] bool hides_target(const nlohmann::json &entry,
+  [[nodiscard]] bool hides_target(std::string_view caller,
+                                  const nlohmann::json &entry,
                                   std::string_view target,
                                   bool target_is_system,
                                   const Presets &presets) const;
   [[nodiscard]] bool presets_skip(std::string_view target) const;
 
+  /* True when HMA-OSS would leave the target alone for this caller because the
+   * target is connected to GMS and the caller asks as the Play Store. */
+  [[nodiscard]] bool gms_ignored(std::string_view caller,
+                                 std::string_view target) const;
+
   /* The packages its presets must leave alone, read once while it is built. */
   std::set<std::string, std::less<>> presets_skip_;
+  PresetFacts facts_;
 };
 
 } // namespace uidfake

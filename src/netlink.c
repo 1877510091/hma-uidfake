@@ -14,6 +14,7 @@
 
 #include "uidfake.h"
 #include <linux/kernel.h>
+#include <linux/mutex.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/version.h> /* LINUX_VERSION_CODE for the resv_start_op guard */
@@ -43,6 +44,7 @@ enum {
 /* A policy larger than one message arrives in pages and is held here until its
  * last page and its CRC have been seen: the live policy is replaced in one step,
  * or not at all. */
+static DEFINE_MUTEX(g_staged_lock);
 static u32 *g_staged;
 static u32 g_staged_total;
 static u32 g_staged_pairs;
@@ -87,16 +89,26 @@ static int kaux_set_begin(struct sk_buff *skb, struct genl_info *info)
 {
 	const u32 *p;
 	u32 len;
+	int rc = 0;
 
-	if (kaux_blob(info, &p, &len) || len < 12)
-		return -EINVAL;
-	if (p[0] > POLICY_MAX_PAIRS || p[1] != 2 * p[0])
-		return -EINVAL;
+	mutex_lock(&g_staged_lock);
+
+	if (kaux_blob(info, &p, &len) || len < 12) {
+		rc = -EINVAL;
+		goto out;
+	}
+	if (p[0] > POLICY_MAX_PAIRS || p[1] != 2 * p[0]) {
+		rc = -EINVAL;
+		goto out;
+	}
 
 	g_staged_total = p[0];
 	g_staged_pairs = 0;
 	g_staged_crc = p[2];
-	return 0;
+
+out:
+	mutex_unlock(&g_staged_lock);
+	return rc;
 }
 
 /* blob: u32 seq, u32 npairs, then npairs * (caller, target) */
@@ -104,31 +116,50 @@ static int kaux_set_page(struct sk_buff *skb, struct genl_info *info)
 {
 	const u32 *p;
 	u32 len, npairs;
+	int rc = 0;
 
-	if (kaux_blob(info, &p, &len) || len < 8)
-		return -EINVAL;
+	mutex_lock(&g_staged_lock);
+
+	if (kaux_blob(info, &p, &len) || len < 8) {
+		rc = -EINVAL;
+		goto out;
+	}
 	npairs = p[1];
-	if (len < 8 + 8 * (unsigned long long)npairs)
-		return -EINVAL;
+	if (len < 8 + 8 * (unsigned long long)npairs) {
+		rc = -EINVAL;
+		goto out;
+	}
 	if (g_staged_total == 0 || p[0] != g_staged_pairs ||
-	    npairs > g_staged_total - g_staged_pairs)
-		return -EINVAL;
+	    npairs > g_staged_total - g_staged_pairs) {
+		rc = -EINVAL;
+		goto out;
+	}
 
 	memcpy(g_staged + 2 * (size_t)g_staged_pairs, p + 2,
 	       (size_t)npairs * 8);
 	g_staged_pairs += npairs;
-	return 0;
+
+out:
+	mutex_unlock(&g_staged_lock);
+	return rc;
 }
 
 static int kaux_set_commit(struct sk_buff *skb, struct genl_info *info)
 {
+	int rc = 0;
+
 	if (kaux_version(info))
 		return -EPROTONOSUPPORT;
-	if (g_staged_total == 0 || g_staged_pairs != g_staged_total)
-		return -EINVAL;
+
+	mutex_lock(&g_staged_lock);
+	if (g_staged_total == 0 || g_staged_pairs != g_staged_total) {
+		rc = -EINVAL;
+		goto out;
+	}
 	if (kaux_crc32(g_staged, 2 * g_staged_pairs) != g_staged_crc) {
 		pr_err("uidfake: policy crc mismatch, keeping previous one\n");
-		return -EINVAL;
+		rc = -EINVAL;
+		goto out;
 	}
 
 	pr_info("uidfake: netlink policy: %u pair(s) in pages\n",
@@ -136,7 +167,10 @@ static int kaux_set_commit(struct sk_buff *skb, struct genl_info *info)
 	policy_apply(g_staged, g_staged_pairs);
 	g_staged_total = 0;
 	g_staged_pairs = 0;
-	return 0;
+
+out:
+	mutex_unlock(&g_staged_lock);
+	return rc;
 }
 
 /*

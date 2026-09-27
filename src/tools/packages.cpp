@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include <algorithm>
+
 #include "abx.hpp"
 #include "common.hpp"
 
@@ -204,6 +206,45 @@ PackageDb::code_dir_of(std::string_view name) const {
   if (it == by_name_.end() || it->second.code_dir.empty())
     return std::nullopt;
   return it->second.code_dir;
+}
+
+/* The users this device has: the directory names under /data/system/users are
+ * the ids. A device without that directory is user 0. */
+std::vector<std::uint32_t> android_users() {
+  std::vector<std::uint32_t> users;
+  std::error_code ec;
+  for (const auto &entry :
+       std::filesystem::directory_iterator{"/data/system/users", ec}) {
+    if (ec)
+      break;
+    std::uint32_t user = 0;
+    if (parse_number(entry.path().filename().string(), user))
+      users.push_back(user);
+  }
+  std::ranges::sort(users);
+  if (users.empty()) {
+    Log::warn("cannot list /data/system/users; assuming user 0");
+    users.push_back(0);
+  }
+  return users;
+}
+
+Pairs expand_users(const Pairs &pairs,
+                   const std::vector<std::uint32_t> &users) {
+  Pairs out;
+  out.reserve(pairs.size() * users.size());
+  for (const std::uint32_t user : users) {
+    const std::uint32_t base = user * kUserSpan;
+
+    for (const auto &pair : pairs) {
+      /* The kernel drops a system uid as a target; it is one in no user. */
+      if (pair.target < kFirstAppUid)
+        continue;
+      out.push_back(Pair{.caller = pair.caller == 0 ? 0 : pair.caller + base,
+                         .target = pair.target + base});
+    }
+  }
+  return out;
 }
 
 } // namespace uidfake

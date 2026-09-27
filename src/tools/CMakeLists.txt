@@ -17,6 +17,7 @@ add_executable(sync-tool
     watcher.cpp
     netlink.cpp
     rules.cpp
+  preset_rules.cpp
     packages.cpp
     paths.cpp
     paging.cpp)

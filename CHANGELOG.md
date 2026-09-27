@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.2
+
+- A rule applies in every user. The rules are per package, but every user has its own uids
+  (uid = the uid at user 0 + user * 100000) and only the user 0 uids reached the kernel, so an app in
+  a work profile queried its own user's uid and matched nothing. The helper reads
+  /data/system/users and writes every pair once per user, each with the replacement its own bucket
+  needs.
+
+- The policy is published without a lock: the spinlock that was taken with interrupts off around it
+  guarded a single pointer assignment, which is an atomic exchange by itself.
+- The staged upload takes one, on the other hand: three commands write the same buffer and nothing
+  serialised them. A second sender could only produce a policy whose CRC does not check out -- refused
+  rather than half applied -- but a mutex keeps them from fighting over it.
+
 ## 0.2.1
 
 - A policy is uploaded in pages and only becomes live when its last page and its CRC check out, so a

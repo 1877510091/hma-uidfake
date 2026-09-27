@@ -55,7 +55,8 @@ private:
     int wd = -1;
     std::filesystem::path path;
     std::uint32_t mask = 0;
-    std::string filter;    /* directory entries this watch is armed for */
+    std::vector<std::string>
+        filter;            /* directory entries this watch is armed for */
     bool app_root = false; /* /data/app: its events are installs */
     bool warned = false;   /* only for desired_: a failure already logged */
   };
