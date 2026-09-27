@@ -24,6 +24,10 @@ c++ -std=c++23 -O1 -I src/tools -o "$paths" scripts/rule_sources_test.cpp src/to
 
 # Both rule formats: what each one does with the same package list, driven with configs instead of
 # a device.
+paging=build/paging_test
+c++ -std=c++23 -O1 -I src/tools -o "$paging" scripts/paging_test.cpp src/tools/paging.cpp -lz
+"$paging"
+
 rules=build/rules_test
 c++ -std=c++23 -O1 -I src/tools -o "$rules" scripts/rules_test.cpp src/tools/rules.cpp \
   src/tools/paths.cpp src/tools/packages.cpp src/tools/abx.cpp

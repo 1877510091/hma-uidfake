@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "netlink.hpp"
 
+#include "paging.hpp"
+
 #include <linux/genetlink.h>
 #include <linux/netlink.h>
 #include <sys/socket.h>
@@ -136,7 +138,7 @@ std::optional<std::uint16_t> NetlinkClient::resolve_family() {
 
   auto *genl = request.genlmsg();
   genl->cmd = CTRL_CMD_GETFAMILY;
-  genl->version = 1;
+  genl->version = kUapiVersion;
 
   auto *attr = reinterpret_cast<nlattr *>(reinterpret_cast<std::byte *>(genl) +
                                           GENL_HDRLEN);
@@ -222,14 +224,11 @@ void NetlinkClient::note_reachable() {
 }
 
 bool NetlinkClient::push(std::span<const Pair> pairs) {
-  /*
-   * Two attempts. A failure drops the cached family id together with the
-   * socket, so a module that was unloaded and reloaded (it gets a new family
-   * id) is found again on the retry instead of the client talking to a dead id
-   * for the rest of its life.
-   */
+  /* Every policy goes up in pages: one message per page, then a commit that the
+   * kernel checks against the total and the CRC before it switches. A policy
+   * that arrives half way never takes effect. */
   for (int attempt = 0; attempt < 2; ++attempt) {
-    if (send_once(pairs)) {
+    if (send_paged(pairs)) {
       note_reachable();
       return true;
     }
@@ -243,7 +242,8 @@ bool NetlinkClient::push(std::span<const Pair> pairs) {
   return false;
 }
 
-bool NetlinkClient::send_once(std::span<const Pair> pairs) {
+bool NetlinkClient::send_command(std::uint8_t cmd,
+                                 std::span<const std::byte> blob) {
   if (!ensure_connected())
     return false;
 
@@ -254,38 +254,57 @@ bool NetlinkClient::send_once(std::span<const Pair> pairs) {
     family_ = resolved;
   }
 
-  const std::size_t blob_len = sizeof(std::uint32_t) * (1 + 2 * pairs.size());
   Buffer request{};
   request.bytes.assign(NLMSG_SPACE(GENL_HDRLEN) +
-                           NLA_ALIGN(NLA_HDRLEN + blob_len),
+                           NLA_ALIGN(NLA_HDRLEN + blob.size()),
                        std::byte{0});
 
   auto *nlh = request.nlmsg();
   nlh->nlmsg_len =
-      NLMSG_LENGTH(GENL_HDRLEN + NLA_HDRLEN + static_cast<int>(blob_len));
+      NLMSG_LENGTH(GENL_HDRLEN + NLA_HDRLEN + static_cast<int>(blob.size()));
   nlh->nlmsg_type = *family_;
   nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
   nlh->nlmsg_seq = ++seq_;
 
   auto *genl = request.genlmsg();
-  genl->cmd = kCmdSet;
+  genl->cmd = cmd;
   genl->version = 1;
 
   auto *attr = reinterpret_cast<nlattr *>(reinterpret_cast<std::byte *>(genl) +
                                           GENL_HDRLEN);
   attr->nla_type = kAttrBlob;
-  attr->nla_len = NLA_HDRLEN + static_cast<int>(blob_len);
-
-  std::span<std::byte> blob(reinterpret_cast<std::byte *>(attr) + NLA_HDRLEN,
-                            blob_len);
-  store_u32(blob, 0, static_cast<std::uint32_t>(pairs.size()));
-  for (std::size_t i = 0; i < pairs.size(); ++i) {
-    store_u32(blob, 4 + 8 * i, pairs[i].caller);
-    store_u32(blob, 8 + 8 * i, pairs[i].target);
-  }
+  attr->nla_len = NLA_HDRLEN + static_cast<int>(blob.size());
+  std::memcpy(reinterpret_cast<std::byte *>(attr) + NLA_HDRLEN, blob.data(),
+              blob.size());
 
   std::vector<std::byte> reply(kReplySize);
   return exchange(std::span{request.bytes}.first(nlh->nlmsg_len), reply);
+}
+
+bool NetlinkClient::send_paged(std::span<const Pair> pairs) {
+  const auto total = static_cast<std::uint32_t>(pairs.size());
+  std::vector<std::byte> begin(12);
+  store_u32(begin, 0, total);
+  store_u32(begin, 4, 2 * total);
+  store_u32(begin, 8, crc32(pairs));
+  if (!send_command(kCmdSetBegin, begin))
+    return false;
+
+  for (std::size_t sent = 0; sent < pairs.size();) {
+    const std::size_t n = std::min(kPagePairs, pairs.size() - sent);
+    std::vector<std::byte> page(8 + 8 * n);
+    store_u32(page, 0, static_cast<std::uint32_t>(sent));
+    store_u32(page, 4, static_cast<std::uint32_t>(n));
+    for (std::size_t i = 0; i < n; ++i) {
+      store_u32(page, 8 + 8 * i, pairs[sent + i].caller);
+      store_u32(page, 12 + 8 * i, pairs[sent + i].target);
+    }
+    if (!send_command(kCmdSetPage, page))
+      return false; /* the kernel never saw a commit: the live policy stays */
+    sent += n;
+  }
+
+  return send_command(kCmdSetCommit, {});
 }
 
 bool NetlinkClient::push_apks(std::span<const ApkEntry> entries) {

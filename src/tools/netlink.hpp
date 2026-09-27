@@ -32,6 +32,10 @@ public:
   NetlinkClient(const NetlinkClient &) = delete;
   NetlinkClient &operator=(const NetlinkClient &) = delete;
 
+  /* The kernel holds at most POLICY_MAX_PAIRS pairs (src/include/uidfake.h),
+   * and one page carries kPagePairs of them. */
+  static constexpr std::size_t kMaxPairs = 4096;
+
   /* Replaces the kernel's policy with `pairs` (an empty list clears it).
    * Failures are logged; false means the kernel side is not reachable yet. */
   [[nodiscard]] bool push(std::span<const Pair> pairs);
@@ -41,17 +45,23 @@ public:
 
 private:
   static constexpr std::string_view kFamilyName = "kaux";
-  /* Must match the enum in src/netlink.c: UNSPEC, SET, PING. */
-  static constexpr std::uint8_t kCmdSet = 1;
-  static constexpr std::uint8_t kCmdApk = 3;
+  /* Must match the enum and the version in src/netlink.c. */
+  static constexpr std::uint8_t kCmdSetBegin = 1;
+  static constexpr std::uint8_t kCmdSetPage = 2;
+  static constexpr std::uint8_t kCmdSetCommit = 3;
+  static constexpr std::uint8_t kCmdPing = 4;
+  static constexpr std::uint8_t kCmdApk = 5;
+  static constexpr std::uint8_t kUapiVersion = 2;
   static constexpr std::uint16_t kAttrBlob = 1;
   static constexpr std::size_t kReplySize = 4096;
 
   /* One line per outage, and one when it ends. */
   void note_reachable();
   [[nodiscard]] bool ensure_connected();
-  [[nodiscard]] bool send_once(std::span<const Pair> pairs);
   [[nodiscard]] bool send_apks_once(std::span<const ApkEntry> entries);
+  [[nodiscard]] bool send_paged(std::span<const Pair> pairs);
+  [[nodiscard]] bool send_command(std::uint8_t cmd,
+                                  std::span<const std::byte> blob);
   [[nodiscard]] std::optional<std::uint16_t> resolve_family();
   [[nodiscard]] bool exchange(std::span<const std::byte> request,
                               std::span<std::byte> reply);

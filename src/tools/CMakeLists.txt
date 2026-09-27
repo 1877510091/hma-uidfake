@@ -18,9 +18,10 @@ add_executable(sync-tool
     netlink.cpp
     rules.cpp
     packages.cpp
-    paths.cpp)
+    paths.cpp
+    paging.cpp)
 
-target_link_libraries(sync-tool PRIVATE nlohmann_json::nlohmann_json dl)
+target_link_libraries(sync-tool PRIVATE nlohmann_json::nlohmann_json dl z)
 # Resolved at run time on purpose: __system_property_wait() and __system_property_serial() are
 # platform-only (the NDK stubs carry no symbol for them), and a dynamic link is what lets dlsym()
 # find them - with -static the NDK links its libdl.a stub, whose dlopen() always fails. libc++

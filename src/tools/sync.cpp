@@ -122,6 +122,15 @@ void Syncer::sync_now(std::string_view why) {
                           }),
               pairs.end());
 
+  /* The kernel holds this many pairs; another attempt cannot change the count.
+   */
+  if (pairs.size() > NetlinkClient::kMaxPairs) {
+    Log::warn("{} pair(s) is more than the kernel holds ({}); keeping the "
+              "previous policy",
+              pairs.size(), NetlinkClient::kMaxPairs);
+    return;
+  }
+
   const auto same_pair = [](const Pair &a, const Pair &b) {
     return a.caller == b.caller && a.target == b.target;
   };

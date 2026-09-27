@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1
+
+- A policy is uploaded in pages and only becomes live when its last page and its CRC check out, so a
+  config with thousands of pairs is applied as one piece instead of being refused as too large.
+- The netlink command ids moved with that, and the family version is 2: a helper and a module of
+  different versions refuse each other instead of reading each other's commands.
+
 ## 0.2.0
 
 - HMA and HMA-OSS each have their own config format and their own rules: the source that exists

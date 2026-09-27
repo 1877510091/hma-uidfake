@@ -78,16 +78,21 @@ for it, an untagged caller -- is what the parameter is for.
 
 ## Protocol
 
-Little endian, same layout as `src/tools/netlink.cpp`.
+Little endian, same layout as `src/tools/netlink.cpp`. The family version is 2, and the kernel
+rejects a request that does not carry it, so a helper and a module of different versions cannot read
+each other's command ids.
 
 ```
-KAUX_CMD_SET  (1)  blob: u32 npairs, then npairs * (caller, target); caller 0 = any caller
-KAUX_CMD_PING (2)  no payload, ACK only
-KAUX_CMD_APK  (3)  blob: u32 n, then n * (st_dev, ino_lo, ino_hi, uid)
+KAUX_CMD_SET_BEGIN  (1)  blob: u32 total_pairs, u32 total_words, u32 crc32
+KAUX_CMD_SET_PAGE   (2)  blob: u32 seq, u32 npairs, then npairs * (caller, target)
+KAUX_CMD_SET_COMMIT (3)  no payload: total and CRC are checked, then applied
+KAUX_CMD_PING       (4)  no payload, ACK only
+KAUX_CMD_APK        (5)  blob: u32 n, then n * (st_dev, ino_lo, ino_hi, uid)
 ```
 
-Family `kaux`, version 1, all three `GENL_ADMIN_PERM`; a blob over 32 KiB is rejected before it is
-parsed.
+Family `kaux`, all commands `GENL_ADMIN_PERM`; a blob over 32 KiB is rejected before it is parsed.
+A policy goes up in pages and only becomes live when the commit matches what was announced, so a
+half-uploaded policy never takes effect.
 
 | limit | value |
 |---|---|
