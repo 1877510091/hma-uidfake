@@ -14,26 +14,8 @@
 
 namespace uidfake {
 
-/*
- * fsnotify watches on the rule sources and on /data/app. Directory events are
- * followed too, so an atomic write-to-temp-then-rename of a config is caught.
- *
- * /data/app is watched at its first level only: an install or an update ends
- * with "~~[random]" being renamed in there, and that event names the directory
- * whose contents say which package landed. Watching deeper would mean waking up
- * for every dexopt write instead.
- *
- * Watches are declared first and armed best effort afterwards: a file that does
- * not exist yet, or that is being replaced while we look, used to be dropped
- * for good when inotify_add_watch() failed, which is how changes went missing
- * entirely. Now anything can ask for a re-arm: the directory events, an
- * IN_IGNORED, or the periodic tick.
- */
 class Watcher {
 public:
-  /* What the caller should do next. Packages carries the "~~" directories that
-   * just appeared or disappeared under /data/app; the rest is a plain resync.
-   */
   struct Tick {
     enum class Kind { Config, Packages, Resync };
 
@@ -44,13 +26,7 @@ public:
   static constexpr auto kDebounce = std::chrono::milliseconds{400};
   /* A continuous stream of changes must not postpone the sync forever. */
   static constexpr auto kDebounceMax = std::chrono::seconds{2};
-  /*
-   * One shot, and only while something is known to be pending: a watch that
-   * could not be created yet (config.json after the unlock, which inotify
-   * cannot see either) or an upload that did not reach the kernel (module not
-   * loaded yet). A module that is working has no timer running at all --
-   * config changes and installs arrive as events.
-   */
+
   static constexpr auto kRetry = std::chrono::seconds{10};
 
   /* One read of the inotify queue: the kernel drops events that do not fit, and

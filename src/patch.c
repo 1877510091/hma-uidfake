@@ -183,8 +183,7 @@ static struct page *page_for(unsigned long addr, unsigned long *off)
 		return NULL;
 	if (!g_walk_warned) {
 		g_walk_warned = true;
-		pr_info("uidfake: page table walk unusable (vendor mm_struct); using "
-			"kimage_voffset\n");
+		pr_info("uidfake: page table walk unusable (vendor mm_struct); using kimage_voffset\n");
 	}
 	return pfn_to_page(phys >> PAGE_SHIFT);
 }

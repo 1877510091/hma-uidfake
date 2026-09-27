@@ -16,24 +16,12 @@
 namespace uidfake {
 namespace {
 
-/*
- * Android's own "this user's credential-encrypted storage is open" flag, set
- * after the first unlock. /data/user/0 appears through a vold mount and inotify
- * cannot report a mount, so this is what turns the unlock into an immediate
- * event instead of a poll guess.
- */
 [[nodiscard]] bool ce_available() {
   char value[PROP_VALUE_MAX] = {};
   return __system_property_get("sys.user.0.ce_available", value) > 0 &&
          value[0] == 't';
 }
 
-/*
- * There is no file descriptor to poll for a property, so before the unlock -
- * when there is nothing to watch and nothing readable anyway - block on the
- * property itself instead of waking up every second. Returns whether the
- * storage is open now.
- */
 /*
  * The unlock is a key being added and a bind mount being made: inotify reports
  * neither. The platform's own waiting call is not part of the NDK's symbols, so
@@ -80,11 +68,6 @@ constexpr std::uint32_t kFileEvents =
 constexpr std::uint32_t kDirEvents = IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE |
                                      IN_ATTRIB | IN_DELETE | IN_MOVED_FROM;
 
-/*
- * Where installed code lives, watched at its first level. An install or an
- * update renames a "~~[random]" directory in here; nothing deeper is watched,
- * so dexopt writing into an existing package does not wake us up at all.
- */
 constexpr std::string_view kAppRoot = "/data/app";
 /* Only the rename in and out matters: creation, removal and both moves. */
 constexpr std::uint32_t kAppDirEvents =
@@ -108,9 +91,6 @@ bool Watcher::open(std::span<const RuleSource> sources) {
     return false;
   }
 
-  /* Declare what we want and arm it best effort: a rule file may not exist yet,
-   * and a failed watch used to mean the file stayed invisible for the whole
-   * lifetime of the process (that is how changes went missing). */
   apply_watches();
 
   /* Nothing is armed here: a retry is asked for when something is missing. */
@@ -129,9 +109,7 @@ void Watcher::arm_retry() {
 }
 
 void Watcher::apply_watches() {
-  /* Rebuilt every time: an HMA-OSS data directory that appeared since the last
-   * pass brings a watch of its own. A path that was already reported keeps that
-   * state, so a failing watch is logged once and not on every re-arm. */
+
   const auto was_warned = [&](const std::filesystem::path &path) {
     return std::ranges::any_of(
         desired_, [&](const Watch &w) { return w.path == path && w.warned; });
@@ -173,9 +151,7 @@ bool Watcher::watches_complete() const {
 }
 
 void Watcher::add(const Watch &want) {
-  /* Remember which of the wanted watches are not armed yet: that is also what
-   * tells the retry timer to come back sooner, since these paths only appear
-   * once /data is unlocked. */
+
   const auto wanted = std::ranges::find_if(
       desired_, [&](const Watch &w) { return w.path == want.path; });
   const auto &path = want.path;
@@ -258,9 +234,7 @@ bool Watcher::handle_inotify_events() {
     }
     const auto watch = std::ranges::find_if(
         watches_, [&](const Watch &w) { return w.wd == event->wd; });
-    /* A watched directory accepts only the names it was armed for: HMA keeps
-     * its own files next to config.json, and an HMA-OSS data directory sits in
-     * /data/misc among everything else. */
+
     if (watch != watches_.end() && event->len > 0 && !watch->filter.empty() &&
         !leaf_matches(event->name, watch->filter))
       continue;
@@ -295,18 +269,11 @@ std::optional<Watcher::Tick> Watcher::wait() {
         {.fd = resync_.get(), .events = POLLIN, .revents = 0},
     }};
 
-    /*
-     * Before the unlock there is nothing to watch and nothing to read, so wait
-     * on the property instead of waking up every second. ce_ has to be updated
-     * here: returning without it made the caller come straight back and spin.
-     */
     if (!ce_) {
       if (!wait_for_unlock())
         continue;
       ce_ = true;
-      /* The mount is there now, so the watches that could not be created
-       * before can be: without this one a change would go unnoticed until
-       * something else happened. */
+
       apply_watches();
       Log::info("credential storage is open (device unlocked)");
       if (!watches_complete())

@@ -19,9 +19,6 @@
 namespace uidfake {
 namespace {
 
-/* HMA-OSS works out what each preset contains on the device and caches it next
- * to its config (preset_cache_v2.json; preset_cache.json before that). Only the
- * app can do that, so what it cached is what is used. */
 [[nodiscard]] Presets
 load_preset_cache(const std::filesystem::path &config_file) {
   Presets presets;
@@ -58,9 +55,6 @@ constexpr std::string_view kAppRoot = "/data/app";
 /* The kernel takes this many caller code dirs. */
 constexpr std::size_t kApkLimit = 1024;
 
-/* "<package>-<random suffix>": the entry that names a package inside an install
- * directory. The suffix is base64 and may contain "-" itself, so the caller's
- * name is matched as a prefix rather than by splitting the string. */
 [[nodiscard]] bool dir_matches(std::string_view leaf, std::string_view pkg) {
   return leaf.size() > pkg.size() && leaf.compare(0, pkg.size(), pkg) == 0 &&
          leaf[pkg.size()] == '-';
@@ -142,11 +136,6 @@ void Syncer::sync_now(std::string_view why) {
     Log::info("synced {} pair(s) ({})", pairs.size(), why);
   }
 
-  /*
-   * Which packages are callers. A rule with caller == 0 applies to anyone, so
-   * then every package is one. Names, not only uids: the directory a caller's
-   * code lives in is looked up by name.
-   */
   std::set<std::uint32_t> caller_uids;
   bool wild = false;
   for (const auto &pair : pairs) {
@@ -162,9 +151,6 @@ void Syncer::sync_now(std::string_view why) {
       callers_.emplace(name, info.uid);
   }
 
-  /* The code directory comes from the same file, so it is refreshed with every
-   * policy: what the package manager recorded is what the kernel is told. The
-   * /data/app events only keep it fresh between two of these passes. */
   std::size_t missing = 0;
   for (const auto &[name, uid] : callers_) {
     const auto dir = packages->code_dir_of(name);
@@ -229,11 +215,7 @@ void Syncer::handle_packages(const std::vector<std::string> &dirs) {
     std::error_code ec;
 
     if (std::filesystem::is_directory(base, ec)) {
-      /*
-       * The directory that just arrived: its entries name the packages that
-       * landed in it. This is the only application directory this program ever
-       * reads, it is the one the event pointed at, and it is read once.
-       */
+
       for (const auto &entry : std::filesystem::directory_iterator{base, ec}) {
         if (ec)
           break;
@@ -250,12 +232,7 @@ void Syncer::handle_packages(const std::vector<std::string> &dirs) {
         changed = true;
       }
     } else {
-      /*
-       * The install directory is gone (replaced by a new one, or uninstalled).
-       * Forget the packages that lived there; if the new directory has already
-       * been seen, its entry took over, and otherwise the next full sync asks
-       * the package manager again.
-       */
+
       for (auto it = code_dirs_.begin(); it != code_dirs_.end();) {
         if (it->second.parent_path() == base) {
           Log::info("{} no longer lives in {}", it->first, it->second.string());
@@ -290,11 +267,7 @@ bool Syncer::run() {
     const auto tick = watcher_.wait();
     if (!tick)
       return false;
-    /*
-     * A key of the policy may have been written mid-replace, so every event
-     * ends in a full pass; an install, on the other hand, only changes one
-     * directory, and that one is read directly.
-     */
+
     if (tick->kind == Watcher::Tick::Kind::Packages)
       handle_packages(tick->dirs);
     else

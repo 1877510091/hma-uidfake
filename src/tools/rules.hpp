@@ -16,10 +16,6 @@
 
 namespace uidfake {
 
-/* What a preset holds, as HMA-OSS worked it out on the device and cached beside
- * its config (preset_cache_v2.json): preset name -> packages. The config only
- * names the presets a caller applies, so this is where their packages come
- * from. */
 using Presets =
     std::map<std::string, std::set<std::string, std::less<>>, std::less<>>;
 

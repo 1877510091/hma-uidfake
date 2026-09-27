@@ -122,6 +122,7 @@ static struct genl_family kaux_family = {
 int netlink_init(void)
 {
 	int rc = genl_register_family(&kaux_family);
+
 	pr_info("uidfake: netlink family '%s' register rc=%d\n",
 		KAUX_FAMILY_NAME, rc);
 	return rc;

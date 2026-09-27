@@ -9,9 +9,6 @@
 
 namespace uidfake {
 
-/* The package manager's own database, which every package's uid, code directory
- * and system flag come from. Not an option: it is where the package manager
- * keeps it. */
 inline constexpr std::string_view kPackagesXml = "/data/system/packages.xml";
 
 /* Which of the two apps a config belongs to. It is a property of where the file
@@ -20,16 +17,6 @@ enum class Tool { Hma, HmaOss };
 
 [[nodiscard]] std::string_view tool_name(Tool tool);
 
-/*
- * One place a tool keeps its rules:
- *
- *   HMA       one file in its own data directory.
- *   HMA-OSS   a data directory whose name carries a random suffix, holding
- *             config.json, and the same thing under /data/system until the
- *             daemon has moved it.
- *
- * `pattern` may carry one '*' for that random part.
- */
 class RuleSource {
 public:
   /* What to watch for one source. A directory watch accepts only entries with

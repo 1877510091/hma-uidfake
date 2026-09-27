@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /* uidfake: kernel-side uid existence guard (userspace-resolved policy). */
 #ifndef UIDFAKE_H
 #define UIDFAKE_H

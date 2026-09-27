@@ -437,7 +437,7 @@ void policy_apply(const u32 *pairs, u32 npairs)
 	u32 i, n = 0;
 	int nh, ok = 0;
 
-	np = (struct policy *)kzalloc(sizeof(*np), GFP_KERNEL);
+	np = kzalloc(sizeof(*np), GFP_KERNEL);
 	if (!np)
 		return;
 
@@ -539,8 +539,7 @@ out:
 		return;
 	}
 
-	pr_info("uidfake: injected %u pair(s), %u caller(s), %u line(s), %u mask word(s), probe "
-		"%u, %s layout\n",
+	pr_info("uidfake: injected %u pair(s), %u caller(s), %u line(s), %u mask word(s), probe %u, %s layout\n",
 		npairs, np->ncallers, np->nlines, np->nmask_words, np->nprobe,
 		np->mirror ? "uid-hash" : "own-hash");
 }
@@ -955,8 +954,8 @@ struct uf_apk { /* 16 bytes */
 #define UF_APK_PROBE 8u
 
 static struct uf_apk g_apk_tab[2][UF_APK_SLOTS];
-static u16 g_apk_used[2][UF_APK_MAX]; /* slots to clear when a buffer is filled
-                                         again */
+/* slots to clear when a buffer is filled again */
+static u16 g_apk_used[2][UF_APK_MAX];
 static u32 g_apk_used_n[2];
 static u32
 	g_apk_cur; /* published buffer, written under the lock, read without it */

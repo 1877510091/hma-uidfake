@@ -35,7 +35,7 @@ void uidfake_tag_close(void);
 typedef long (*uidfake_syscall_t)(const struct pt_regs *);
 
 struct hook_entry {
-	unsigned nr;
+	unsigned int nr;
 	uidfake_syscall_t ours;
 	uidfake_syscall_t orig;
 };
@@ -155,8 +155,8 @@ struct uidfake_args {
 	u64 regs[3];
 };
 
-static asmlinkage long uid_hook(const struct pt_regs *regs, unsigned which_user,
-				uidfake_syscall_t orig)
+static asmlinkage long uid_hook(const struct pt_regs *regs,
+				unsigned int which_user, uidfake_syscall_t orig)
 {
 	struct uidfake_args args;
 	u32 repl;
@@ -263,7 +263,7 @@ static noinline void uidfake_tag_verify(u32 tag)
  */
 noinline void uidfake_tag_close(void)
 {
-	static unsigned logged;
+	static unsigned int logged;
 
 	uidfake_tag_group(0);
 	if (logged < 4 && UF_DEBUG_ON()) {
@@ -305,7 +305,7 @@ noinline void uidfake_tag_close(void)
 static noinline void uidfake_close_unheard(const struct file *file, u32 dev,
 					   int depth)
 {
-	static unsigned logged;
+	static unsigned int logged;
 
 	if (logged >= 6)
 		return;
@@ -367,10 +367,10 @@ static uidfake_syscall_t *main_table;
 static uidfake_syscall_t *compat_table;
 #endif
 
-static unsigned patch_entries(uidfake_syscall_t *table, struct hook_entry *e,
-			      unsigned n)
+static unsigned int patch_entries(uidfake_syscall_t *table,
+				  struct hook_entry *e, unsigned int n)
 {
-	unsigned i;
+	unsigned int i;
 
 	for (i = 0; i < n; i++) {
 		uidfake_syscall_t *slot = &table[e[i].nr];
@@ -388,9 +388,9 @@ static unsigned patch_entries(uidfake_syscall_t *table, struct hook_entry *e,
 }
 
 static void unpatch_entries(uidfake_syscall_t *table, struct hook_entry *e,
-			    unsigned n)
+			    unsigned int n)
 {
-	unsigned i;
+	unsigned int i;
 
 	if (!table)
 		return;
@@ -406,7 +406,7 @@ static void unpatch_entries(uidfake_syscall_t *table, struct hook_entry *e,
 static int patch_tables(void)
 {
 	unsigned long table = uidfake_lookup("sys_call_table");
-	unsigned n;
+	unsigned int n;
 
 	if (!table || uidfake_patch_init())
 		return -ENOENT;
@@ -436,8 +436,7 @@ static int patch_tables(void)
 		if (n != ARRAY_SIZE(g_chook)) {
 			unpatch_entries(compat_table, g_chook,
 					ARRAY_SIZE(g_chook));
-			pr_warn("uidfake: 32-bit compat table not hooked; 32-bit callers are "
-				"uncovered\n");
+			pr_warn("uidfake: 32-bit compat table not hooked; 32-bit callers are uncovered\n");
 		} else {
 			pr_info("uidfake: %u uid syscall(s) hooked in compat_sys_call_table\n",
 				n);
