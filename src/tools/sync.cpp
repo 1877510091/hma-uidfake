@@ -6,36 +6,51 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <nlohmann/json.hpp>
 #include <set>
 #include <sstream>
 #include <string>
 #include <utility>
 
 #include "common.hpp"
-#include "hma.hpp"
 #include "packages.hpp"
+#include "rules.hpp"
 
 namespace uidfake {
 namespace {
 
-/* /data/user/0/<pkg> is a bind mount of /data/data/<pkg>; an old ROM or a
- * plain adb shell may only have the second one. */
-constexpr std::string_view kDataUserPrefix = "/data/user/0/";
-constexpr std::string_view kDataDataPrefix = "/data/data/";
-
-std::filesystem::path resolve_config_path(const std::filesystem::path &path) {
+/* HMA-OSS works out what each preset contains on the device and caches it next
+ * to its config (preset_cache_v2.json; preset_cache.json before that). Only the
+ * app can do that, so what it cached is what is used. */
+[[nodiscard]] Presets
+load_preset_cache(const std::filesystem::path &config_file) {
+  Presets presets;
   std::error_code ignored;
-  if (std::filesystem::exists(path, ignored))
-    return path;
+  auto cache = config_file.parent_path() / "preset_cache_v2.json";
+  if (!std::filesystem::exists(cache, ignored))
+    cache = config_file.parent_path() / "preset_cache.json";
 
-  auto text = path.string();
-  if (text.starts_with(kDataUserPrefix)) {
-    text.replace(0, kDataUserPrefix.size(), kDataDataPrefix);
-    const std::filesystem::path alternative{text};
-    if (std::filesystem::exists(alternative, ignored))
-      return alternative;
+  nlohmann::json json;
+  try {
+    std::ifstream in{cache};
+    if (!in)
+      return presets;
+    in >> json;
+  } catch (const std::exception &e) {
+    Log::warn("cannot parse {}: {}", cache.string(), e.what());
+    return presets;
   }
-  return path;
+
+  for (const auto &[name, list] :
+       json.value("cache", nlohmann::json::object()).items()) {
+    if (!list.is_array())
+      continue;
+    auto &packages = presets[name];
+    for (const auto &item : list)
+      if (item.is_string())
+        packages.insert(item.get<std::string>());
+  }
+  return presets;
 }
 
 /* Where installed code lives; the same root the watcher reports events from. */
@@ -57,49 +72,61 @@ std::optional<Config> parse_args(int argc, char **argv) {
   Config config;
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg = argv[i];
-    const bool has_value = i + 1 < argc;
     if (arg == "--once") {
       config.once = true;
-    } else if (arg == "--config" && has_value) {
-      config.config = argv[++i];
-    } else if (arg == "--xml" && has_value) {
-      config.packages_xml = argv[++i];
     } else {
-      std::fprintf(
-          stderr,
-          "usage: %s [--once] [--config <json>] [--xml <packages.xml>]\n",
-          argc > 0 ? argv[0] : "sync-tool");
+      std::fprintf(stderr, "usage: %s [--once]\n",
+                   argc > 0 ? argv[0] : "sync-tool");
       return std::nullopt;
     }
   }
-  config.config = resolve_config_path(config.config);
   return config;
 }
 
 void Syncer::sync_now(std::string_view why) {
-  const auto policy = HmaPolicy::load(config_.config);
-  if (!policy) {
+  const std::optional<RuleSource> source = RuleSource::active(sources_);
+  if (!source) {
     /* Once per outage: before the unlock this used to repeat on every tick. */
     if (!config_refused_) {
       config_refused_ = true;
-      Log::warn("cannot read {} yet (keeping the previous policy)",
-                config_.config.string());
+      Log::warn("no readable rule source yet (keeping the previous policy)");
     }
     return;
   }
   if (config_refused_) {
     config_refused_ = false;
-    Log::info("{} is readable again", config_.config.string());
+    Log::info("rule source readable again");
   }
 
-  const auto packages = PackageDb::load(config_.packages_xml);
+  const auto packages = PackageDb::load(std::string{kPackagesXml});
   if (!packages) {
-    Log::warn("cannot read {} (will retry on the next event)",
-              config_.packages_xml.string());
+    Log::warn("cannot read {} (will retry on the next event)", kPackagesXml);
     return;
   }
 
-  const Pairs pairs = policy->expand(*packages);
+  /* The path says which tool the file belongs to, so it says which rules read
+   * it: nothing is guessed from the contents. */
+  const auto file = source->config();
+  if (!file)
+    return; /* it went away between the check and the read */
+  std::unique_ptr<Rules> rules;
+  if (source->tool() == Tool::HmaOss)
+    rules = HmaOssRules::load(*file);
+  else
+    rules = HmaRules::load(*file);
+  if (!rules)
+    return;
+  const Presets presets =
+      rules->uses_presets() ? load_preset_cache(*file) : Presets{};
+  Pairs pairs = rules->expand(*packages, presets);
+  std::ranges::sort(pairs, [](const Pair &a, const Pair &b) {
+    return a.caller != b.caller ? a.caller < b.caller : a.target < b.target;
+  });
+  pairs.erase(std::unique(pairs.begin(), pairs.end(),
+                          [](const Pair &a, const Pair &b) {
+                            return a.caller == b.caller && a.target == b.target;
+                          }),
+              pairs.end());
 
   const auto same_pair = [](const Pair &a, const Pair &b) {
     return a.caller == b.caller && a.target == b.target;
@@ -149,7 +176,7 @@ void Syncer::sync_now(std::string_view why) {
   }
   if (missing != 0)
     Log::warn("{} caller(s) have no code directory in {}", missing,
-              config_.packages_xml.string());
+              kPackagesXml);
 
   publish_code_dirs();
 }
@@ -250,9 +277,14 @@ bool Syncer::run() {
   if (config_.once)
     return true;
 
-  if (!watcher_.open(config_.config))
+  if (!watcher_.open(sources_))
     return false;
-  Log::info("watching {}", config_.config.string());
+  if (const auto active = RuleSource::active(sources_)) {
+    if (const auto file = active->config())
+      Log::info("watching {}", file->string());
+  } else {
+    Log::info("no rule config yet (waiting for the known places)");
+  }
 
   for (;;) {
     const auto tick = watcher_.wait();

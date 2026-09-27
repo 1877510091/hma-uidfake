@@ -16,8 +16,10 @@ add_executable(sync-tool
     sync.cpp
     watcher.cpp
     netlink.cpp
-    hma.cpp
-    packages.cpp)
+    rules.cpp
+    packages.cpp
+    paths.cpp)
+
 target_link_libraries(sync-tool PRIVATE nlohmann_json::nlohmann_json dl)
 # Resolved at run time on purpose: __system_property_wait() and __system_property_serial() are
 # platform-only (the NDK stubs carry no symbol for them), and a dynamic link is what lets dlsym()

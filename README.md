@@ -1,6 +1,7 @@
 # HMA UID Fake
 
-KernelSU module that makes the uid of an app hidden by HMA answer as if it did not exist:
+KernelSU module that makes the uid of an app hidden by HMA (or HMA-OSS) answer as if it did
+not exist:
 
 ```
 getpriority(PRIO_USER, uid)       -> -ESRCH

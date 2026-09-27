@@ -5,17 +5,18 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
 #include "common.hpp"
+#include "paths.hpp"
 
 namespace uidfake {
 
 /*
- * fsnotify watches on HMA's config and on /data/app, plus the debounce and
- * periodic-resync timers. Directory events are followed too, so an atomic
- * write-to-temp-then-rename of config.json is caught.
+ * fsnotify watches on the rule sources and on /data/app. Directory events are
+ * followed too, so an atomic write-to-temp-then-rename of a config is caught.
  *
  * /data/app is watched at its first level only: an install or an update ends
  * with "~~[random]" being renamed in there, and that event names the directory
@@ -56,7 +57,7 @@ public:
    * this is the size the kernel's own examples use. */
   static constexpr std::size_t kReadBuffer = std::size_t{64} * 1024;
 
-  [[nodiscard]] bool open(const std::filesystem::path &config);
+  [[nodiscard]] bool open(std::span<const RuleSource> sources);
 
   /* Blocks until something worth resyncing happens; nullopt if polling broke.
    */
@@ -78,11 +79,12 @@ private:
     int wd = -1;
     std::filesystem::path path;
     std::uint32_t mask = 0;
-    bool app_root = false; /* /data/app: its events are installs, not rules */
+    std::string filter;    /* directory entries this watch is armed for */
+    bool app_root = false; /* /data/app: its events are installs */
     bool warned = false;   /* only for desired_: a failure already logged */
   };
 
-  void add(const std::filesystem::path &path, std::uint32_t mask);
+  void add(const Watch &want);
   [[nodiscard]] bool handle_inotify_events();
   void arm_debounce();
 
@@ -92,9 +94,8 @@ private:
   std::vector<Watch> watches_; /* what inotify actually gave us */
   std::vector<Watch> desired_; /* what we want, whether or not it exists yet */
   std::vector<std::string>
-      app_dirs_;            /* "~~" directories seen under /data/app */
-  std::string config_name_; /* basename of the watched config */
-  int config_dir_wd_ = -1;  /* its directory watch, if it was armed */
+      app_dirs_;                    /* "~~" directories seen under /data/app */
+  std::vector<RuleSource> sources_; /* the places a config can be in */
   std::optional<std::chrono::steady_clock::time_point>
       pending_;     /* burst in progress */
   bool ce_ = false; /* sys.user.0.ce_available as last seen */

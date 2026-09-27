@@ -17,6 +17,10 @@ jobs.
   reader against the first bytes of a real `packages.xml`. Real sources, so word sizes, field order
   and the encoding of a branch written into kernel text are covered.
 - `scripts/branch_encode_test.c` checks the branch encoding on its own, in user space.
+- `scripts/config_paths_test.cpp` builds a tree and checks the rule-source specs: an exact file, an
+  HMA-OSS data directory named with a random suffix, and specs that match nothing yet.
+- `scripts/rules_test.cpp` drives both rule formats with configs instead of a device: HMA's hidden
+  set and built-in list, and HMA-OSS's decision chain with its opposite list and presets.
 - `scripts/lookup_model.py` states what a query touches as a function of `(caller, target)` and the
   load counts, which the C cannot assert about itself.
 - `scripts/check-undefined.sh` checks every undefined symbol against the DDK's per-KMI

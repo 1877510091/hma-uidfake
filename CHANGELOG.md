@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0
+
+- HMA and HMA-OSS each have their own config format and their own rules: the source that exists
+  decides which one is in use, and each file is read by the parser written for it.
+- HMA-OSS works as well as HMA: its config is read from
+  /data/misc/hide_my_applist_*/config.json, and the preset cache it writes beside it says what each
+  preset contains, so presets (which only the app can work out on the device) are applied too.
+- The rule decision is the one HMA-OSS makes: the extra list, the opposite list, the applied
+  templates, the applied presets, then whitelist mode. Rules from both tools are applied together.
+
 ## 0.1.3
 
 - Config changes are noticed again. An event on a watched directory was taken for an install event

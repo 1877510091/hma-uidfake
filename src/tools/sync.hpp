@@ -10,15 +10,14 @@
 #include <vector>
 
 #include "netlink.hpp"
+#include "paths.hpp"
 #include "watcher.hpp"
 
 namespace uidfake {
 
-/* Paths and flags coming from the command line. */
+/* Command line. The rule places and the package database are not options: this
+ * reads where the tools and the package manager keep them. */
 struct Config {
-  std::filesystem::path config =
-      "/data/user/0/com.tsng.hidemyapplist/files/config.json";
-  std::filesystem::path packages_xml = "/data/system/packages.xml";
   bool once = false;
 };
 
@@ -39,7 +38,7 @@ struct Config {
  */
 class Syncer {
 public:
-  explicit Syncer(Config config) : config_(std::move(config)) {}
+  explicit Syncer(Config config) : config_(config) {}
 
   /* Parses and pushes once; failures are logged, never fatal. `why` ends up in
    * the log line of a pass that changed something, so the log says what woke
@@ -55,6 +54,9 @@ private:
   /* stat() every caller's code directory and push the result. */
   void publish_code_dirs();
 
+  /* Where a config can be. Not a command line option: this reads where the apps
+   * keep them. */
+  const std::vector<RuleSource> sources_ = RuleSource::known();
   Config config_;
   bool config_refused_ = false;
   NetlinkClient netlink_;

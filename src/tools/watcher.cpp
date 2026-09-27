@@ -92,7 +92,8 @@ constexpr std::uint32_t kAppDirEvents =
 
 } // namespace
 
-bool Watcher::open(const std::filesystem::path &config) {
+bool Watcher::open(std::span<const RuleSource> sources) {
+  sources_.assign(sources.begin(), sources.end());
   inotify_.reset(::inotify_init1(IN_CLOEXEC | IN_NONBLOCK));
   if (!inotify_.valid()) {
     Log::warn("inotify_init1: {}", std::strerror(errno));
@@ -107,24 +108,10 @@ bool Watcher::open(const std::filesystem::path &config) {
     return false;
   }
 
-  /*
-   * Declare what we want and arm it best effort: config.json in particular may
-   * not exist yet, and a failed watch used to mean the file stayed invisible
-   * for the whole lifetime of the process (that is how changes went missing).
-   */
-  desired_ = {
-      {.path = config, .mask = kFileEvents},
-      {.path = config.parent_path(), .mask = kDirEvents},
-      {.path = kAppRoot, .mask = kAppDirEvents, .app_root = true},
-  };
+  /* Declare what we want and arm it best effort: a rule file may not exist yet,
+   * and a failed watch used to mean the file stayed invisible for the whole
+   * lifetime of the process (that is how changes went missing). */
   apply_watches();
-
-  /* The directory watch is only there for an atomic replace of the config
-   * itself; the name tells the two apart when events arrive. */
-  config_name_ = config.filename().string();
-  const auto dir = std::ranges::find_if(
-      watches_, [&](const Watch &w) { return w.path == config.parent_path(); });
-  config_dir_wd_ = dir == watches_.end() ? -1 : dir->wd;
 
   /* Nothing is armed here: a retry is asked for when something is missing. */
   if (!watches_complete())
@@ -142,8 +129,42 @@ void Watcher::arm_retry() {
 }
 
 void Watcher::apply_watches() {
+  /* Rebuilt every time: an HMA-OSS data directory that appeared since the last
+   * pass brings a watch of its own. A path that was already reported keeps that
+   * state, so a failing watch is logged once and not on every re-arm. */
+  const auto was_warned = [&](const std::filesystem::path &path) {
+    return std::ranges::any_of(
+        desired_, [&](const Watch &w) { return w.path == path && w.warned; });
+  };
+  /* Exactly one config is followed: the tool that is in use. While neither is
+   * installed yet, the places one would appear in are watched instead. */
+  std::vector<RuleSource::Watch> wants;
+  if (const auto active = RuleSource::active(sources_)) {
+    wants = active->watches();
+  } else {
+    for (const auto &source : sources_)
+      for (auto &watch : source.watches())
+        wants.push_back(std::move(watch));
+  }
+
+  std::vector<Watch> fresh;
+  fresh.reserve(wants.size() + 1);
+  for (const auto &want : wants)
+    fresh.push_back(Watch{.path = want.path,
+                          .mask = want.kind == RuleSource::Watch::Kind::File
+                                      ? kFileEvents
+                                      : kDirEvents,
+                          .filter = want.name,
+                          .app_root = false,
+                          .warned = was_warned(want.path)});
+  fresh.push_back(Watch{.path = kAppRoot,
+                        .mask = kAppDirEvents,
+                        .filter = {},
+                        .app_root = true,
+                        .warned = was_warned(kAppRoot)});
+  desired_ = std::move(fresh);
   for (const auto &want : desired_)
-    add(want.path, want.mask);
+    add(want);
 }
 
 bool Watcher::watches_complete() const {
@@ -151,15 +172,15 @@ bool Watcher::watches_complete() const {
                              [](const Watch &w) { return !w.warned; });
 }
 
-void Watcher::add(const std::filesystem::path &path, std::uint32_t mask) {
+void Watcher::add(const Watch &want) {
   /* Remember which of the wanted watches are not armed yet: that is also what
-   * tells the resync timer to come back sooner, since these paths only appear
+   * tells the retry timer to come back sooner, since these paths only appear
    * once /data is unlocked. */
   const auto wanted = std::ranges::find_if(
-      desired_, [&](const Watch &w) { return w.path == path; });
-  const bool app_root = wanted != desired_.end() && wanted->app_root;
+      desired_, [&](const Watch &w) { return w.path == want.path; });
+  const auto &path = want.path;
 
-  const int wd = ::inotify_add_watch(inotify_.get(), path.c_str(), mask);
+  const int wd = ::inotify_add_watch(inotify_.get(), path.c_str(), want.mask);
   if (wd < 0) {
     if (wanted != desired_.end() && !wanted->warned) {
       wanted->warned = true;
@@ -175,12 +196,16 @@ void Watcher::add(const std::filesystem::path &path, std::uint32_t mask) {
   }
   for (auto &watch : watches_) {
     if (watch.wd == wd) {
-      watch = Watch{.wd = wd, .path = path, .mask = mask, .app_root = app_root};
+      watch = want;
+      watch.wd = wd;
       return;
     }
   }
-  watches_.push_back(
-      Watch{.wd = wd, .path = path, .mask = mask, .app_root = app_root});
+  watches_.push_back(Watch{.wd = wd,
+                           .path = want.path,
+                           .mask = want.mask,
+                           .filter = want.filter,
+                           .app_root = want.app_root});
 }
 
 void Watcher::arm_debounce() {
@@ -231,24 +256,18 @@ bool Watcher::handle_inotify_events() {
       rearm = true;
       continue;
     }
-    /*
-     * HMA keeps its own files next to config.json, and that directory is only
-     * watched so a config written to a temporary file and renamed into place is
-     * caught. Anything else in there is none of our business: without this,
-     * every file HMA writes wakes the whole sync up.
-     */
-    if (event->len > 0 && event->wd == config_dir_wd_ &&
-        config_name_ != event->name)
+    const auto watch = std::ranges::find_if(
+        watches_, [&](const Watch &w) { return w.wd == event->wd; });
+    /* A watched directory accepts only the names it was armed for: HMA keeps
+     * its own files next to config.json, and an HMA-OSS data directory sits in
+     * /data/misc among everything else. */
+    if (watch != watches_.end() && event->len > 0 && !watch->filter.empty() &&
+        !leaf_matches(event->name, watch->filter))
       continue;
     if (event->mask & (IN_CREATE | IN_MOVED_TO | IN_DELETE | IN_MOVED_FROM)) {
       /* A file we could not watch before may exist now, or vice versa. */
       rearm = true;
     }
-    /* Only the /data/app watch reports installs; every other watch is a rule
-     * source. Taking any watch for the install root is how a config change was
-     * dropped here. */
-    const auto watch = std::ranges::find_if(
-        watches_, [&](const Watch &w) { return w.wd == event->wd; });
     if (watch != watches_.end() && watch->app_root) {
       /* An install directory appeared or went away; hand the name to the
        * caller, which reads that one directory and nothing else. */
