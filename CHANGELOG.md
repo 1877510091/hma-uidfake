@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.3
+
+- Config changes are noticed again. An event on a watched directory was taken for an install event
+  and dropped, so a changed config was only picked up by the periodic pass -- and that pass is gone.
+
 ## 0.1.2
 
 - The policy and the caller code table are sent to the kernel only when they changed, and only

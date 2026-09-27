@@ -78,7 +78,8 @@ private:
     int wd = -1;
     std::filesystem::path path;
     std::uint32_t mask = 0;
-    bool warned = false; /* only for desired_: a failure already logged */
+    bool app_root = false; /* /data/app: its events are installs, not rules */
+    bool warned = false;   /* only for desired_: a failure already logged */
   };
 
   void add(const std::filesystem::path &path, std::uint32_t mask);

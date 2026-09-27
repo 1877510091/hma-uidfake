@@ -115,7 +115,7 @@ bool Watcher::open(const std::filesystem::path &config) {
   desired_ = {
       {.path = config, .mask = kFileEvents},
       {.path = config.parent_path(), .mask = kDirEvents},
-      {.path = kAppRoot, .mask = kAppDirEvents},
+      {.path = kAppRoot, .mask = kAppDirEvents, .app_root = true},
   };
   apply_watches();
 
@@ -157,6 +157,7 @@ void Watcher::add(const std::filesystem::path &path, std::uint32_t mask) {
    * once /data is unlocked. */
   const auto wanted = std::ranges::find_if(
       desired_, [&](const Watch &w) { return w.path == path; });
+  const bool app_root = wanted != desired_.end() && wanted->app_root;
 
   const int wd = ::inotify_add_watch(inotify_.get(), path.c_str(), mask);
   if (wd < 0) {
@@ -174,11 +175,12 @@ void Watcher::add(const std::filesystem::path &path, std::uint32_t mask) {
   }
   for (auto &watch : watches_) {
     if (watch.wd == wd) {
-      watch = Watch{.wd = wd, .path = path, .mask = mask};
+      watch = Watch{.wd = wd, .path = path, .mask = mask, .app_root = app_root};
       return;
     }
   }
-  watches_.push_back(Watch{.wd = wd, .path = path, .mask = mask});
+  watches_.push_back(
+      Watch{.wd = wd, .path = path, .mask = mask, .app_root = app_root});
 }
 
 void Watcher::arm_debounce() {
@@ -242,10 +244,12 @@ bool Watcher::handle_inotify_events() {
       /* A file we could not watch before may exist now, or vice versa. */
       rearm = true;
     }
-    const bool from_app_root = std::ranges::any_of(
+    /* Only the /data/app watch reports installs; every other watch is a rule
+     * source. Taking any watch for the install root is how a config change was
+     * dropped here. */
+    const auto watch = std::ranges::find_if(
         watches_, [&](const Watch &w) { return w.wd == event->wd; });
-
-    if (from_app_root) {
+    if (watch != watches_.end() && watch->app_root) {
       /* An install directory appeared or went away; hand the name to the
        * caller, which reads that one directory and nothing else. */
       if (event->len > 0 && (event->mask & IN_ISDIR)) {
