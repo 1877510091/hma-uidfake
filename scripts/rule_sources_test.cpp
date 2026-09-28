@@ -105,11 +105,22 @@ int main(int argc, char **argv)
 	     "the first source stays the only one in use");
 	{
 		const auto watches = oss.watches();
-		must(watches.size() == 2 &&
+		/*
+		 * Its directory and the file itself, plus the place a second data
+		 * directory would appear in -- watched for that name alone, so no run
+		 * can start reading a different config.
+		 */
+		must(watches.size() == 3 &&
 			     watched(watches, oss_file.parent_path(),
 				     "config.json") &&
-			     watched(watches, oss_file, ""),
-		     "never a second config");
+			     watched(watches, oss_file, "") &&
+			     watched(watches,
+				     oss_file.parent_path().parent_path(),
+				     oss.pattern()
+					     .parent_path()
+					     .filename()
+					     .string()),
+		     "its directory, its file, and the place a data directory appears");
 	}
 
 	/* Without HMA, HMA-OSS is the one in use. */

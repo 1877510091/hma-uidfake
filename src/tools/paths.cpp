@@ -133,13 +133,10 @@ std::vector<RuleSource::Watch> RuleSource::watches() const {
   }
 
   const auto matches = match_dirs(dir);
-  if (matches.empty()) {
-    /* Nothing there yet: watch where the data directory will appear. */
-    watches.push_back(Watch{.path = dir.parent_path(),
-                            .kind = Watch::Kind::Directory,
-                            .names = {dir.filename().string()}});
-    return watches;
-  }
+
+  watches.push_back(Watch{.path = dir.parent_path(),
+                          .kind = Watch::Kind::Directory,
+                          .names = {dir.filename().string()}});
 
   for (const auto &match : matches)
     watch_dir(match);
