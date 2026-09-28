@@ -51,7 +51,7 @@ jobs:
           make -C "$KDIR" ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- M="$stage" modules
           llvm-strip -d "$stage/hma_uidfake.ko" || true
           cp "$stage/hma_uidfake.ko" "out/${{ matrix.kmi }}_arm64_hma_uidfake.ko"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ko-${{ matrix.kmi }}
           path: out/*.ko
@@ -99,10 +99,13 @@ jobs:
           set -euo pipefail
           cmake --build build -j"$(nproc)"
           ls -la build/dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: module-zip
           path: build/dist/*.zip
+          # Without this the zip is put inside an archive of the artifact's own,
+          # so what a user downloads is a zip holding the module zip.
+          archive: false
 
   release:
     name: attach to release
@@ -117,6 +120,14 @@ jobs:
         with:
           name: module-zip
           path: dist
+      # Same reason as the ko job: collect what came down, wherever it landed.
+      - name: Collect the module zip
+        run: |
+          set -euo pipefail
+          find dist -mindepth 2 -name '*.zip' -exec cp -t dist {} + 2>/dev/null || true
+          ls -la dist
+          test -n "$(find dist -maxdepth 1 -name '*.zip' -print -quit)" ||
+            { echo "no module zip in dist"; exit 1; }
       - name: Write update.json
         run: |
           set -euo pipefail
