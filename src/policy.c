@@ -959,6 +959,15 @@ static __always_inline u32 policy_lookup_core(uid_t target, u32 app)
    * involved. */
 	cid = policy_cid_by_app(app, p);
 	/*
+	 * A caller with no rules is answered here: the hash and the masks below can
+	 * only turn this into a zero, and most callers are in that state, so the cost
+	 * a hooked syscall adds is the lookup and not the whole hot path.
+	 */
+	if (cid == POLICY_ID_NONE) {
+		rcu_read_unlock();
+		return 0;
+	}
+	/*
    * One hash for both the line and the slot inside it: the kernel's own uid
    * hash gives the bucket line directly (8 buckets per line) and its low bits
    * give the starting slot, so the hot path hashes the target once instead of
