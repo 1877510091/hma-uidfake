@@ -353,6 +353,29 @@ bool HmaOssRules::gms_ignored(std::string_view caller,
          facts_.gms_connected.contains(target);
 }
 
+/* The names the config applies, each once, in a stable order. */
+std::vector<std::string> HmaOssRules::presets_in_use() const {
+  std::vector<std::string> names;
+
+  if (scope_ == nullptr)
+    return names;
+  for (const auto &[caller, entry] : scope_->items()) {
+    const auto *applied = find_array(entry, "applyPresets");
+
+    if (applied == nullptr)
+      continue;
+    for (const auto &item : *applied) {
+      if (!item.is_string())
+        continue;
+      auto name = item.get<std::string>();
+      if (!std::ranges::contains(names, name))
+        names.push_back(std::move(name));
+    }
+  }
+  std::ranges::sort(names);
+  return names;
+}
+
 /* The names the config applies, split by whether the cache had them. */
 void HmaOssRules::report_presets(const PackageDb &packages,
                                  const Presets &presets,

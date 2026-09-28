@@ -15,6 +15,11 @@ constexpr std::uint8_t kEndDocument = 1;
 constexpr std::uint8_t kStartTag = 2;
 constexpr std::uint8_t kEndTag = 3;
 constexpr std::uint8_t kText = 4;
+constexpr std::uint8_t kCdataSection = 5;
+constexpr std::uint8_t kIgnorableWhitespace = 7;
+constexpr std::uint8_t kProcessingInstruction = 8;
+constexpr std::uint8_t kComment = 9;
+constexpr std::uint8_t kDocDecl = 10;
 constexpr std::uint8_t kAttribute = 15;
 
 /* Payload types, in the high nibble. */
@@ -272,6 +277,22 @@ Reader::Event Reader::next() {
         return event;
       event.kind = Event::Kind::Text;
       return event;
+    /*
+     * A comment, whitespace, a CDATA section, a processing instruction or a
+     * document declaration: each carries one plain string and nothing this
+     * reader needs. Real packages.xml files are written by more than one
+     * writer, and refusing the whole document over a comment is how a device
+     * ends up with no rules at all.
+     */
+    case kCdataSection:
+    case kIgnorableWhitespace:
+    case kProcessingInstruction:
+    case kComment:
+    case kDocDecl:
+      (void)plain_utf();
+      if (failed_)
+        return event;
+      continue;
     case kAttribute: {
       event.name = interned();
       if (failed_)

@@ -67,7 +67,7 @@ starts_with_any(std::string_view value,
  * that entry" without unpacking anything. */
 [[nodiscard]] bool file_has_entry(const std::filesystem::path &apk,
                                   std::string_view entry) {
-  constexpr std::uintmax_t kTail = 4u << 20;
+  constexpr std::uintmax_t kTail = 1u << 20;
   std::error_code ignored;
   const auto size = std::filesystem::file_size(apk, ignored);
   if (ignored || size == 0)
@@ -134,8 +134,15 @@ constexpr std::array kRootLibs{
 
 } // namespace
 
-Presets scan_presets(const PackageDb &packages) {
+Presets scan_presets(const PackageDb &packages,
+                     const std::set<std::string, std::less<>> &wanted) {
   Presets presets;
+  /* Only the presets the caller asked for pay for an apk read: the string rules
+   * are free, opening a file is not. */
+  const bool want_root = wanted.contains("root_apps");
+  const bool want_sus = wanted.contains("sus_apps");
+  const bool want_xposed = wanted.contains("xposed");
+
   for (const auto &[name, info] : packages.by_name()) {
     (void)info;
     if (std::ranges::contains(kReserved, name))
@@ -156,7 +163,8 @@ Presets scan_presets(const PackageDb &packages) {
                            "com.smartpack.", "org.fdroid.fdroid.privileged"}) ||
           ends_with_any(name, {".viper4android", ".viperfx", ".magisk"}) ||
           contains_any(name, {".busybox", ".apatch."}) ||
-          name.ends_with(".apatch") || apk_has_lib(packages, name, kRootLibs) ||
+          name.ends_with(".apatch") ||
+          (want_root && apk_has_lib(packages, name, kRootLibs)) ||
           apk_has_any(packages, name,
                       {"assets/gamma_profiles.json", "assets/main.jar"}))
         presets["root_apps"].insert(std::string{name});
@@ -167,13 +175,14 @@ Presets scan_presets(const PackageDb &packages) {
                                "nextapp.fx", "com.ghisler.", "ru.zdevs.",
                                "com.mixplorer", "bin.mt.", "com.x0.strai.",
                                "com.microsoft.rdc.", "com.teamviewer."}) ||
-        apk_has_any(packages, name,
-                    {"assets/APKEditor.pk8", "assets/testkey.pk8",
-                     "assets/key/testkey.pk8"}))
+        (want_sus && apk_has_any(packages, name,
+                                 {"assets/APKEditor.pk8", "assets/testkey.pk8",
+                                  "assets/key/testkey.pk8"})))
       presets["sus_apps"].insert(std::string{name});
 
     /* xposed */
-    if (apk_has_any(packages, name,
+    if (want_xposed &&
+        apk_has_any(packages, name,
                     {"assets/xposed_init", "META-INF/xposed/module.prop"}))
       presets["xposed"].insert(std::string{name});
 

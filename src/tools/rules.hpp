@@ -21,7 +21,9 @@ using Presets =
 /* preset_rules.cpp: the scanned half of the OSS presets, computed from the
  * installed packages so the tool does not depend on the app's per-process copy.
  */
-[[nodiscard]] Presets scan_presets(const PackageDb &packages);
+[[nodiscard]] Presets
+scan_presets(const PackageDb &packages,
+             const std::set<std::string, std::less<>> &wanted);
 
 /*
  * The rules of one config file. The two apps share their code and not their
@@ -74,6 +76,12 @@ public:
 
   /* Only HMA-OSS has presets, so only it needs the cache read for it. */
   [[nodiscard]] virtual bool uses_presets() const { return false; }
+
+  /* The preset names the config applies, each once. Empty when the format has
+   * none, and used to decide whether the cache already answers everything. */
+  [[nodiscard]] virtual std::vector<std::string> presets_in_use() const {
+    return {};
+  }
 
   /* Facts the decision needs that do not live in the config file. */
   virtual void set_preset_facts(PresetFacts facts) { (void)facts; }
@@ -180,6 +188,7 @@ public:
                            bool target_is_system,
                            const Presets &presets) const override;
   [[nodiscard]] bool uses_presets() const override { return true; }
+  [[nodiscard]] std::vector<std::string> presets_in_use() const override;
   void set_preset_facts(PresetFacts facts) override {
     facts_ = std::move(facts);
   }
