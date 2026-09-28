@@ -163,8 +163,14 @@ struct uidfake_args {
 	u64 regs[3];
 };
 
-static asmlinkage long uid_hook(const struct pt_regs *regs,
-				unsigned int which_user, uidfake_syscall_t orig)
+/*
+ * The original syscall is reached through a pointer this module stored, and a
+ * pre-kCFI kernel checks such calls against the callee's jump table; the function
+ * that makes them is marked __nocfi, as KernelSU's dispatcher is.
+ */
+static asmlinkage long __nocfi uid_hook(const struct pt_regs *regs,
+					unsigned int which_user,
+					uidfake_syscall_t orig)
 {
 	struct uidfake_args args;
 	u32 repl;

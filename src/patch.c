@@ -40,6 +40,14 @@ static int probe_noop(struct kprobe *p, struct pt_regs *r)
  * resolves .symbol_name through kallsyms internally -- unregistered immediately,
  * so nothing stays behind.
  */
+/*
+ * Pre-kCFI kernels (before 6.1) check an indirect call against the callee's jump
+ * table, so the address a call has to carry is the .cfi_jt one; from 6.1 the check
+ * is a type hash on the function itself and there is no jump table to prefer. The
+ * split is the one KernelSU makes with USE_KCFI.
+ */
+#define UF_USE_KCFI (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0))
+
 static unsigned long lookup_exported(const char *symbol)
 {
 	struct kprobe kp = { .symbol_name = symbol, .pre_handler = probe_noop };
@@ -52,7 +60,12 @@ static unsigned long lookup_exported(const char *symbol)
 	return addr;
 }
 
-static unsigned long lookup_name(const char *name)
+/*
+ * The call goes to an address kallsyms handed us, and on a pre-kCFI kernel the
+ * indirect-call check consults the callee's jump table: a function that reaches a
+ * resolved address is marked __nocfi, the way KernelSU marks its dispatcher.
+ */
+static noinline unsigned long __nocfi lookup_name(const char *name)
 {
 	unsigned long (*fn)(const char *) =
 		(void *)lookup_exported("kallsyms_lookup_name");
@@ -78,6 +91,20 @@ static int find_symbol_cb(void *data, const char *name, unsigned long addr)
 		ctx->next = addr;
 	if (!ctx->addr && name && strcmp(name, ctx->name) == 0)
 		ctx->addr = addr;
+#if !UF_USE_KCFI
+	/* The jump-table variant is the one a call site can reach: prefer it, and
+	 * stop looking once it is found. */
+	{
+		const size_t len = ctx->name ? strlen(ctx->name) : 0;
+		const char *suffix = ".cfi_jt";
+
+		if (name && len && strncmp(name, ctx->name, len) == 0 &&
+		    strcmp(name + len, suffix) == 0) {
+			ctx->addr = addr;
+			return 1;
+		}
+	}
+#endif
 	return 0;
 }
 
@@ -93,50 +120,66 @@ static int find_symbol_cb_mod(void *data, const char *name, struct module *mod,
 }
 #endif
 
-static void find_symbol(const char *name, struct find_ctx *ctx)
+static noinline void __nocfi find_symbol(const char *name, struct find_ctx *ctx)
 {
-	int (*walk)(void *, int (*)(void *, const char *, unsigned long),
-		    void *) =
-		(void *)lookup_exported("kallsyms_on_each_symbol");
-
 	ctx->name = name;
 	ctx->addr = 0;
 	ctx->next = 0;
-	if (!walk)
-		return;
+	/*
+	 * The walk takes the callback first and its data second -- both signatures
+	 * do, the one whose callback has the module argument and the one without.
+	 * Passing them the other way round hands the kernel a stack address to jump
+	 * to, which is a fault the moment it is reached.
+	 */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-	walk(ctx, find_symbol_cb, NULL);
+	{
+		int (*walk)(int (*)(void *, const char *, unsigned long),
+			    void *) =
+			(void *)lookup_exported("kallsyms_on_each_symbol");
+
+		if (walk)
+			walk(find_symbol_cb, ctx);
+	}
 #else
 	/*
 	 * The older signature takes the callback with the module argument, so it is
 	 * called through a small shim with the same shape.
 	 */
 	{
-		int (*old)(void *,
-			   int (*)(void *, const char *, struct module *,
-				   unsigned long),
-			   void *) = (void *)walk;
+		int (*walk)(int (*)(void *, const char *, struct module *,
+				    unsigned long),
+			    void *) =
+			(void *)lookup_exported("kallsyms_on_each_symbol");
 
-		old(ctx, find_symbol_cb_mod, NULL);
+		if (walk)
+			walk(find_symbol_cb_mod, ctx);
 	}
 #endif
 }
 
 unsigned long uidfake_lookup(const char *name)
 {
-	unsigned long addr = lookup_name(name);
-	char dotted[KSYM_NAME_LEN + 16];
+	unsigned long addr;
 
-	if (addr)
-		return addr;
+#if !UF_USE_KCFI
+	char cfi[KSYM_NAME_LEN + 16];
 
-	/* The CFI variant: selinux_setprocattr becomes selinux_setprocattr..cfi_jt. */
-	if (!strchr(name, '.') && snprintf(dotted, sizeof(dotted), "%s..cfi_jt",
-					   name) < (int)sizeof(dotted)) {
-		addr = lookup_name(dotted);
+	/*
+	 * A call site on these kernels reaches the .cfi_jt variant, and the plain
+	 * address fails its check: take the jump-table symbol when there is one.
+	 * selinux_setprocattr becomes selinux_setprocattr.cfi_jt.
+	 */
+	if (!strchr(name, '.') &&
+	    snprintf(cfi, sizeof(cfi), "%s.cfi_jt", name) < (int)sizeof(cfi)) {
+		addr = lookup_name(cfi);
 		if (addr)
 			return addr;
 	}
+#endif
+
+	addr = lookup_name(name);
+	if (addr)
+		return addr;
 
 	{
 		struct find_ctx ctx;
