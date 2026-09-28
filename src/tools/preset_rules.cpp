@@ -225,6 +225,14 @@ Presets scan_presets(const PackageDb &packages,
         apk_has_any(packages, name,
                     {"assets/xposed_init", "META-INF/xposed/module.prop"}))
       presets["xposed"].insert(std::string{name});
+    /* The app puts itself in this preset by construction -- its exactPackageNames is
+     * {BuildConfig.APP_PACKAGE_NAME} -- so a reader that only looks at the apk
+     * entries hides one package less than the app does. */
+    if (want_xposed)
+      for (const std::string_view own : {"org.frknkrc44.hma_oss",
+                                         "icu.nullptr.hidemyapplist"})
+        if (packages.by_name().contains(own))
+          presets["xposed"].insert(std::string{own});
 
     /* shizuku_dhizuku */
     if (name.starts_with("moe.shizuku."))
