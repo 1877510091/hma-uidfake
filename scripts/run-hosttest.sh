@@ -34,6 +34,13 @@ clang++ -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wda
   src/tools/paths.cpp src/tools/packages.cpp src/tools/abx.cpp
 "$rules"
 
+presets=build/presets_test
+clang++ -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl \
+  -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference \
+  -Wdouble-promotion -Wformat=2 -I src/tools -o "$presets" scripts/presets_test.cpp \
+  src/tools/preset_rules.cpp src/tools/packages.cpp src/tools/abx.cpp -lz
+"$presets"
+
 # Same sources, one more round under ASan/UBSan: a proxy outliving its owner is not
 # a warning, it is a fault the first time it runs.
 
@@ -43,9 +50,14 @@ clang++ -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++23 -O1 -Wal
 clang++ -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference -Wdouble-promotion -Wformat=2 -I src/tools -o "$rules" scripts/rules_test.cpp src/tools/rules.cpp \
   src/tools/preset_rules.cpp \
   src/tools/paths.cpp src/tools/packages.cpp src/tools/abx.cpp
+clang++ -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl \
+  -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference \
+  -Wdouble-promotion -Wformat=2 -I src/tools -o "$presets" scripts/presets_test.cpp \
+  src/tools/preset_rules.cpp src/tools/packages.cpp src/tools/abx.cpp -lz
 "$abx"
-"$paths"
 "$paging"
 "$rules"
+"$presets"
+
 
 

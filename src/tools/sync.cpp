@@ -122,7 +122,16 @@ Syncer::open_rules(const std::filesystem::path &file,
     if (!missing.empty()) {
       Log::info("presets not in the cache, reading the apks for {} of them",
                 missing.size());
-      facts.scanned = scan_presets(packages, missing);
+      {
+        ScanMap apps;
+
+        for (const auto &[name, info] : packages.by_name())
+          apps.emplace(name, ScanTarget{.uid = info.uid,
+                                        .code_dir = info.code_dir,
+                                        .system = info.system,
+                                        .perms = info.perms});
+        facts.scanned = scan_presets(apps, missing);
+      }
     }
   }
   rules->set_preset_facts(std::move(facts));

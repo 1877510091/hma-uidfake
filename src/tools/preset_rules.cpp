@@ -65,8 +65,15 @@ starts_with_any(std::string_view value,
 /* An APK keeps its entry names in the central directory at the end of the file,
  * plain and uncompressed, so reading the tail answers "does this file carry
  * that entry" without unpacking anything. */
-[[nodiscard]] bool file_has_entry(const std::filesystem::path &apk,
-                                  std::string_view entry) {
+
+/* A binary AndroidManifest.xml keeps its strings in UTF-16, and the app
+ * searches the manifest for its own constants written that way. Turning the
+ * text into UTF-16 and looking for those bytes in the same tail answers the
+ * same question. */
+/* A zip entry name is plain bytes, a binary manifest string is UTF-16: try
+ * both. */
+[[nodiscard]] bool file_has(const std::filesystem::path &apk,
+                            std::string_view text) {
   constexpr std::uintmax_t kTail = 1u << 20;
   std::error_code ignored;
   const auto size = std::filesystem::file_size(apk, ignored);
@@ -79,31 +86,38 @@ starts_with_any(std::string_view value,
   in.seekg((std::streamoff)from);
   std::vector<char> data(size - from);
   in.read(data.data(), (std::streamsize)data.size());
-  const auto got = (std::size_t)in.gcount();
-  return std::string_view{data.data(), got}.find(entry) !=
-         std::string_view::npos;
+  const auto end = data.begin() + in.gcount();
+  std::string wide;
+  wide.reserve(text.size() * 2);
+  for (char c : text) {
+    wide.push_back(c);
+    wide.push_back('\0');
+  }
+  return std::search(data.begin(), end, text.begin(), text.end()) != end ||
+         std::search(data.begin(), end, wide.begin(), wide.end()) != end;
 }
 
-/* Every split of an app can carry entries, so all the APKs in its code
- * directory are looked at, the way HMA-OSS does. */
-[[nodiscard]] bool
-apk_has_any(const PackageDb &packages, std::string_view name,
-            std::initializer_list<std::string_view> entries) {
-  const auto dir = packages.code_dir_of(name);
-  if (!dir)
+[[nodiscard]] bool apk_has_any(const ScanMap &apps, std::string_view name,
+                               std::initializer_list<std::string_view> texts) {
+  const auto it = apps.find(std::string{name});
+  if (it == apps.end())
     return false;
+  const auto dir = it->second.code_dir;
   std::error_code ignored;
-  for (const auto &item : std::filesystem::directory_iterator{*dir, ignored}) {
+  for (const auto &item : std::filesystem::directory_iterator{dir, ignored}) {
     if (ignored)
       break;
     if (item.path().extension() != ".apk")
       continue;
-    for (const auto &entry : entries)
-      if (file_has_entry(item.path(), entry))
+    for (const auto &text : texts)
+      if (file_has(item.path(), text))
         return true;
   }
   return false;
 }
+
+/* Every split of an app can carry entries, so all the APKs in its code
+ * directory are looked at, the way HMA-OSS does. */
 
 constexpr std::array kRootLibs{
     std::string_view{"libkernelsu.so"},
@@ -119,14 +133,13 @@ constexpr std::array kRootLibs{
  * looks at are tried. */
 /* The library names live inside the APK as lib/<arch>/<name>: both ABIs HMA-OSS
  * looks at are tried. */
-[[nodiscard]] bool apk_has_lib(const PackageDb &packages, std::string_view name,
+[[nodiscard]] bool apk_has_lib(const ScanMap &apps, std::string_view name,
                                const auto &libs) {
   for (const auto &lib : libs) {
     const std::string arm64 = std::string{"lib/arm64-v8a/"} + std::string{lib};
     const std::string arm32 =
         std::string{"lib/armeabi-v7a/"} + std::string{lib};
-    if (apk_has_any(packages, name, {arm64}) ||
-        apk_has_any(packages, name, {arm32}))
+    if (apk_has_any(apps, name, {arm64}) || apk_has_any(apps, name, {arm32}))
       return true;
   }
   return false;
@@ -174,7 +187,7 @@ Presets load_preset_cache(const std::filesystem::path &config_file,
   return presets;
 }
 
-Presets scan_presets(const PackageDb &packages,
+Presets scan_presets(const ScanMap &apps,
                      const std::set<std::string, std::less<>> &wanted) {
   Presets presets;
   /* Only the presets the caller asked for pay for an apk read: the string rules
@@ -182,9 +195,10 @@ Presets scan_presets(const PackageDb &packages,
   const bool want_root = wanted.contains("root_apps");
   const bool want_sus = wanted.contains("sus_apps");
   const bool want_xposed = wanted.contains("xposed");
+  const bool want_acc = wanted.contains("accessibility_apps");
+  const bool want_shizuku = wanted.contains("shizuku_dhizuku");
 
-  for (const auto &[name, info] : packages.by_name()) {
-    (void)info;
+  for (const auto &[name, info] : apps) {
     if (std::ranges::contains(kReserved, name))
       continue;
     const bool detector =
@@ -204,8 +218,8 @@ Presets scan_presets(const PackageDb &packages,
           ends_with_any(name, {".viper4android", ".viperfx", ".magisk"}) ||
           contains_any(name, {".busybox", ".apatch."}) ||
           name.ends_with(".apatch") ||
-          (want_root && apk_has_lib(packages, name, kRootLibs)) ||
-          apk_has_any(packages, name,
+          (want_root && apk_has_lib(apps, name, kRootLibs)) ||
+          apk_has_any(apps, name,
                       {"assets/gamma_profiles.json", "assets/main.jar"}))
         presets["root_apps"].insert(std::string{name});
     }
@@ -215,23 +229,64 @@ Presets scan_presets(const PackageDb &packages,
                                "nextapp.fx", "com.ghisler.", "ru.zdevs.",
                                "com.mixplorer", "bin.mt.", "com.x0.strai.",
                                "com.microsoft.rdc.", "com.teamviewer."}) ||
-        (want_sus && apk_has_any(packages, name,
+        (want_sus && apk_has_any(apps, name,
                                  {"assets/APKEditor.pk8", "assets/testkey.pk8",
                                   "assets/key/testkey.pk8"})))
       presets["sus_apps"].insert(std::string{name});
 
+    if (want_root && !detector &&
+        (contains_any(name, {".busybox", ".apatch."}) ||
+         ends_with_any(name,
+                       {".viper4android", ".viperfx", ".magisk", ".apatch"}) ||
+         starts_with_any(name,
+                         {"com.smartpack.", "org.fdroid.fdroid.privileged"}) ||
+         apk_has_any(apps, name,
+                     {"libkernelsu.so", "libapd.so", "libmagisk.so",
+                      "libmagiskboot.so", "libmmrl-file-manager.so",
+                      "libmmrl-kernelsu.so", "libzakoboot.so",
+                      "gamma_profiles.json", "main.jar"})))
+      presets["root_apps"].insert(std::string{name});
+
+    if (want_sus &&
+        (starts_with_any(name, {"com.offsec.", "com.termux", "com.realvnc.",
+                                "bin.mt.", "com.x0.strai.",
+                                "com.microsoft.rdc.", "com.teamviewer."}) ||
+         apk_has_any(apps, name,
+                     {"APKEditor.pk8", "testkey.pk8", "key/testkey.pk8"})))
+      presets["sus_apps"].insert(std::string{name});
+
+    /* accessibility_apps */
+    /* A system app never goes into accessibility_apps (reloadPresets says so).
+     */
+    if (want_acc && !detector && !info.system &&
+        apk_has_any(apps, name,
+                    {"android.permission.BIND_ACCESSIBILITY_SERVICE"}))
+      presets["accessibility_apps"].insert(std::string{name});
+
+    /* shizuku_dhizuku: the prefix above, or the provider the manifest names */
+    if (want_shizuku && apk_has_any(apps, name,
+                                    {"rikka.shizuku.ShizukuProvider",
+                                     "com.rosan.dhizuku.server.provider"}))
+      presets["shizuku_dhizuku"].insert(std::string{name});
+
+    /* root_apps by the old superuser permission, unless the manifest is
+     * whitelisted */
+    if (want_root && !detector &&
+        apk_has_any(apps, name, {"android.permission.ACCESS_SUPERUSER"}) &&
+        !apk_has_any(apps, name,
+                     {"org.mozilla.gecko", "MEIZUPUSH", "hk.alipay.wallet",
+                      "com.tencent.mm", "com.heytap.", "com.netmera.Netmera"}))
+      presets["root_apps"].insert(std::string{name});
+
     /* xposed */
     if (want_xposed &&
-        apk_has_any(packages, name,
+        apk_has_any(apps, name,
                     {"assets/xposed_init", "META-INF/xposed/module.prop"}))
       presets["xposed"].insert(std::string{name});
-    /* The app puts itself in this preset by construction -- its exactPackageNames is
-     * {BuildConfig.APP_PACKAGE_NAME} -- so a reader that only looks at the apk
-     * entries hides one package less than the app does. */
     if (want_xposed)
-      for (const std::string_view own : {"org.frknkrc44.hma_oss",
-                                         "icu.nullptr.hidemyapplist"})
-        if (packages.by_name().contains(own))
+      for (const std::string_view own :
+           {"org.frknkrc44.hma_oss", "icu.nullptr.hidemyapplist"})
+        if (apps.contains(own))
           presets["xposed"].insert(std::string{own});
 
     /* shizuku_dhizuku */
@@ -261,7 +316,12 @@ Presets scan_presets(const PackageDb &packages,
                                "com.potato.",
                                "eu.xiaomi."}) ||
         ends_with_any(name, {".evolution", ".evolutionx", ".overlay.fog"}))
-      presets["custom_rom"].insert(std::string{name});
+      if (starts_with_any(name, {
+
+                                }))
+        presets["custom_rom"].insert(std::string{name});
+
+    presets["custom_rom"].insert(std::string{name});
   }
   return presets;
 }

@@ -19,7 +19,10 @@ namespace uidfake {
 struct PackageInfo {
   std::uint32_t uid = 0;          /* the app id, as packages.xml stores it */
   std::filesystem::path code_dir; /* where its code lives */
-  bool system = false;            /* ApplicationInfo.FLAG_SYSTEM */
+  bool system = false;
+  /* The permissions the platform keeps on record for it (packages.xml <perms>).
+   */
+  std::set<std::string, std::less<>> perms;
 };
 
 /*

@@ -21,6 +21,22 @@ using Presets =
 /* preset_rules.cpp: the scanned half of the OSS presets, computed from the
  * installed packages so the tool does not depend on the app's per-process copy.
  */
+/* What one package is, for the rules below. */
+struct ScanTarget {
+  std::uint32_t uid = 0;
+  std::filesystem::path code_dir;
+  bool system = false;
+  std::set<std::string, std::less<>> perms;
+};
+
+using ScanMap = std::map<std::string, ScanTarget, std::less<>>;
+
+[[nodiscard]] Presets
+scan_presets(const ScanMap &apps,
+             const std::set<std::string, std::less<>> &wanted);
+
+/* The same rules, reading the package list from the package manager's database.
+ */
 [[nodiscard]] Presets
 scan_presets(const PackageDb &packages,
              const std::set<std::string, std::less<>> &wanted);
