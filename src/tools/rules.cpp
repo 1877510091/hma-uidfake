@@ -433,9 +433,33 @@ void HmaOssRules::report_presets(const PackageDb &packages,
   if (!found.empty())
     Log::info("presets: {} ({} pair(s) come only from them)", name_list(found),
               extra);
-  if (!missing.empty())
-    Log::info("! presets: {} (missing from the cache, so they hide nothing)",
-              name_list(missing));
+  /*
+   * A name the app's cache did not have is not a name that hides nothing: the
+   * expansion also reads this module's own scan and its built-in list, so the
+   * report says which of the two applies instead of writing them all off.
+   */
+  std::vector<std::string> unknown;
+  for (const auto &name : missing) {
+    const bool covered =
+        facts_.scanned.contains(name) ||
+        std::ranges::any_of(oss_presets::kStatic, [&](const auto &entry) {
+          return entry.name == name;
+        });
+    if (!covered)
+      unknown.push_back(name);
+  }
+  if (!missing.empty()) {
+    if (unknown.empty())
+      Log::info(
+          "presets: {} (not in the app's cache; this module's own scan and "
+          "its built-in list stand in for them)",
+          name_list(missing));
+    else
+      Log::info(
+          "! presets: {} (not in the app's cache and unknown to this module "
+          "either, so they hide nothing)",
+          name_list(unknown));
+  }
 }
 
 /* One caller's entry, as this file read it: the mode, how many entries each

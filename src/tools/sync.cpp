@@ -33,8 +33,12 @@ load_preset_cache(const std::filesystem::path &config_file,
   nlohmann::json json;
   try {
     std::ifstream in{cache};
-    if (!in)
+    if (!in) {
+      /* The app writes this after its own scan; until then there is nothing
+       * here and the module scans for the presets itself. */
+      Log::info("preset cache: none at {}", cache.string());
       return presets;
+    }
     in >> json;
   } catch (const std::exception &e) {
     Log::warn("cannot parse {}: {}", cache.string(), e.what());
@@ -57,6 +61,15 @@ load_preset_cache(const std::filesystem::path &config_file,
        json.value("riskyPackageCache", nlohmann::json::array()))
     if (item.is_string())
       facts.gms_connected.insert(item.get<std::string>());
+
+  {
+    std::size_t entries = 0;
+
+    for (const auto &[name, list] : presets)
+      entries += list.size();
+    Log::info("preset cache: {} ({} preset(s), {} entr(ies))", cache.string(),
+              presets.size(), entries);
+  }
   return presets;
 }
 
