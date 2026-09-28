@@ -248,6 +248,20 @@ static struct page *kernel_page(unsigned long addr, unsigned long *off)
 	pte_t *pte;
 	phys_addr_t phys;
 
+	*off = offset_in_page(addr);
+
+	if (UF_DEBUG_ON()) {
+		pgd_t *probe = (pgd_t *)((unsigned long)patch_mm +
+					 offsetof(struct mm_struct, pgd));
+
+		pr_info("uidfake: walk %px: mm=%px pgd@%#zx=%px pgd[%#lx]=%#lx\n",
+			(void *)addr, (void *)patch_mm,
+			(size_t)offsetof(struct mm_struct, pgd), (void *)probe,
+			(unsigned long)addr >> 30,
+			((const unsigned long *)
+				 probe)[(unsigned long)addr >> 30]);
+	}
+
 	if (pgd_none(*pgd) || pgd_bad(*pgd))
 		return NULL;
 	p4d = p4d_offset(pgd, addr);
@@ -256,7 +270,6 @@ static struct page *kernel_page(unsigned long addr, unsigned long *off)
 	pud = pud_offset(p4d, addr);
 	if (pud_none(*pud) || pud_bad(*pud))
 		return NULL;
-	*off = offset_in_page(addr);
 	if (pud_leaf(*pud)) {
 		phys = (phys_addr_t)(pud_val(*pud) & ~(PUD_SIZE - 1)) +
 		       (addr & (PUD_SIZE - 1));

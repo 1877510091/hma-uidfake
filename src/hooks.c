@@ -165,8 +165,8 @@ struct uidfake_args {
 
 /*
  * The original syscall is reached through a pointer this module stored, and a
- * pre-kCFI kernel checks such calls against the callee's jump table; the function
- * that makes them is marked __nocfi, as KernelSU's dispatcher is.
+ * pre-kCFI kernel checks such calls against the callee's jump table; the functions
+ * that make them are marked __nocfi, as KernelSU's dispatcher is.
  */
 static asmlinkage long __nocfi uid_hook(const struct pt_regs *regs,
 					unsigned int which_user,
@@ -308,14 +308,6 @@ noinline void uidfake_tag_close(void)
  */
 #define UF_DIR_DEPTH 4
 
-/*
- * The app's code directory is what the helper registers, so an open of anything
- * inside it -- the apk, a vdex, an odex, a library -- names the app as soon as
- * the directory is reached. The walk is one or two levels (the same for every
- * artifact) and only runs while a child is still unnamed.
- */
-#define UF_DIR_DEPTH 4
-
 static noinline void uidfake_close_unheard(const struct file *file, u32 dev,
 					   int depth)
 {
@@ -440,15 +432,17 @@ static unsigned int patch_entries(uidfake_syscall_t *table,
 
 	for (i = 0; i < n; i++) {
 		uidfake_syscall_t *slot = &table[e[i].nr];
+		uidfake_syscall_t orig = slot[0];
 
-		e[i].orig = slot[0];
 		if (uidfake_patch_text(slot, &e[i].ours,
 				       sizeof(uidfake_syscall_t), true) ||
 		    slot[0] != e[i].ours) {
 			pr_warn("uidfake: patching syscall %u failed\n",
 				e[i].nr);
-			return 0;
+			e[i].orig = NULL;
+			return i;
 		}
+		e[i].orig = orig;
 	}
 	return n;
 }
@@ -485,7 +479,7 @@ static int patch_tables(void)
 	main_table = (uidfake_syscall_t *)table;
 	n = patch_entries(main_table, g_hook, ARRAY_SIZE(g_hook));
 	if (n != ARRAY_SIZE(g_hook)) {
-		unpatch_entries(main_table, g_hook, ARRAY_SIZE(g_hook));
+		unpatch_entries(main_table, g_hook, n);
 		return -EIO;
 	}
 	pr_info("uidfake: %u uid syscall(s) hooked in sys_call_table\n", n);
@@ -500,8 +494,7 @@ static int patch_tables(void)
 		compat_table = (uidfake_syscall_t *)table;
 		n = patch_entries(compat_table, g_chook, ARRAY_SIZE(g_chook));
 		if (n != ARRAY_SIZE(g_chook)) {
-			unpatch_entries(compat_table, g_chook,
-					ARRAY_SIZE(g_chook));
+			unpatch_entries(compat_table, g_chook, n);
 			pr_warn("uidfake: 32-bit compat table not hooked; 32-bit callers are uncovered\n");
 		} else {
 			pr_info("uidfake: %u uid syscall(s) hooked in compat_sys_call_table\n",
