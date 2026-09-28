@@ -134,6 +134,46 @@ constexpr std::array kRootLibs{
 
 } // namespace
 
+Presets load_preset_cache(const std::filesystem::path &config_file,
+                          PresetFacts &facts) {
+  Presets presets;
+  std::error_code ignored;
+  auto cache = config_file.parent_path() / kPresetCacheNew;
+  if (!std::filesystem::exists(cache, ignored))
+    cache = config_file.parent_path() / kPresetCacheOld;
+
+  nlohmann::json json;
+  try {
+    std::ifstream in{cache};
+    if (!in)
+      return presets;
+    in >> json;
+  } catch (const std::exception &e) {
+    Log::warn("cannot parse {}: {}", cache.string(), e.what());
+    return presets;
+  }
+
+  // items() is a proxy into its JSON owner. Keep that owner alive for the loop,
+  // including with NDK r27's compiler, which does not extend its lifetime here.
+  const auto cache_entries = json.value("cache", nlohmann::json::object());
+  for (const auto &[name, list] : cache_entries.items()) {
+    if (!list.is_array())
+      continue;
+    auto &packages = presets[name];
+    for (const auto &item : list)
+      if (item.is_string())
+        packages.insert(item.get<std::string>());
+  }
+
+  /* The same cache says which packages are connected to GMS: a preset hit still
+   * leaves those visible to a caller that asks as one of the GMS packages. */
+  for (const auto &item :
+       json.value("riskyPackageCache", nlohmann::json::array()))
+    if (item.is_string())
+      facts.gms_connected.insert(item.get<std::string>());
+  return presets;
+}
+
 Presets scan_presets(const PackageDb &packages,
                      const std::set<std::string, std::less<>> &wanted) {
   Presets presets;

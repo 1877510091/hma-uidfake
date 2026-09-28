@@ -95,10 +95,68 @@ constexpr auto kHmaOssConfig = R"({
   }
 })";
 
+/* Read the real cache loader, rather than supplying only hand-built sets. */
+void test_preset_cache()
+{
+	const auto config =
+		write_config("preset_cache_test/config.json", kHmaOssConfig);
+	const auto cache_dir = config.parent_path();
+	const auto old_cache = cache_dir / uidfake::kPresetCacheOld;
+	const auto new_cache = cache_dir / uidfake::kPresetCacheNew;
+	std::filesystem::remove(old_cache);
+	std::filesystem::remove(new_cache);
+	uidfake::PresetFacts facts;
+	check(uidfake::load_preset_cache(config, facts).empty(), true,
+	      "cache: missing files");
+	write_config("preset_cache_test/preset_cache.json",
+		     "{\"cache\":{\"legacy\":[\"com.example.legacy\"]}}");
+	auto presets = uidfake::load_preset_cache(config, facts);
+	check(presets.contains("legacy"), true,
+	      "cache: legacy filename fallback");
+	write_config(
+		"preset_cache_test/preset_cache_v2.json",
+		"{\"cache\":{"
+		"\"risky\":[\"com.example.preset\",\"com.example.ignored\","
+		"\"com.example.preset\",7,null],"
+		"\"empty\":[],\"not_a_list\":false},"
+		"\"riskyPackageCache\":[\"com.example.gms\",9,null]}");
+	presets = uidfake::load_preset_cache(config, facts);
+	check(presets.size() == 2, true, "cache: keep array entries only");
+	check(!presets.contains("legacy"), true, "cache: prefer v2 filename");
+	check(presets.contains("risky") && presets.at("risky").size() == 2 &&
+		      presets.at("risky").contains("com.example.preset"),
+	      true,
+	      "cache: retain membership, ignore nonstrings and duplicates");
+	check(presets.contains("empty") && presets.at("empty").empty(), true,
+	      "cache: an empty preset is present, not missing");
+	check(facts.gms_connected.size() == 1 &&
+		      facts.gms_connected.contains("com.example.gms"),
+	      true, "cache: GMS-connected membership");
+	const auto rules = HmaOssRules::load(config);
+	check(rules && rules->hides("com.example.caller", "com.example.preset",
+				    false, presets),
+	      true, "cache: cached membership reaches the rule decision");
+	check(rules && rules->hides("com.example.caller", "com.example.ignored",
+				    false, presets),
+	      false, "cache: ignored packages remain visible");
+	write_config("preset_cache_test/preset_cache_v2.json", "{}");
+	facts = {};
+	check(uidfake::load_preset_cache(config, facts).empty(), true,
+	      "cache: absent keys");
+	write_config("preset_cache_test/preset_cache_v2.json", "{invalid");
+	check(uidfake::load_preset_cache(config, facts).empty(), true,
+	      "cache: malformed JSON");
+	std::filesystem::remove(new_cache);
+	std::filesystem::remove(old_cache);
+	std::filesystem::remove(config);
+	std::filesystem::remove(cache_dir);
+}
+
 } // namespace
 
 int main()
 {
+	test_preset_cache();
 	const auto hma_path = write_config("rules_hma.json", kHmaConfig);
 	const auto oss_path = write_config("rules_oss.json", kHmaOssConfig);
 

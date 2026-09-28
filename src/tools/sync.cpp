@@ -21,58 +21,6 @@
 namespace uidfake {
 namespace {
 
-[[nodiscard]] Presets
-load_preset_cache(const std::filesystem::path &config_file,
-                  PresetFacts &facts) {
-  Presets presets;
-  std::error_code ignored;
-  auto cache = config_file.parent_path() / kPresetCacheNew;
-  if (!std::filesystem::exists(cache, ignored))
-    cache = config_file.parent_path() / kPresetCacheOld;
-
-  nlohmann::json json;
-  try {
-    std::ifstream in{cache};
-    if (!in) {
-      /* The app writes this after its own scan; until then there is nothing
-       * here and the module scans for the presets itself. */
-      Log::info("preset cache: none at {}", cache.string());
-      return presets;
-    }
-    in >> json;
-  } catch (const std::exception &e) {
-    Log::warn("cannot parse {}: {}", cache.string(), e.what());
-    return presets;
-  }
-
-  for (const auto &[name, list] :
-       json.value("cache", nlohmann::json::object()).items()) {
-    if (!list.is_array())
-      continue;
-    auto &packages = presets[name];
-    for (const auto &item : list)
-      if (item.is_string())
-        packages.insert(item.get<std::string>());
-  }
-
-  /* The same cache says which packages are connected to GMS: a preset hit still
-   * leaves those visible to a caller that asks as one of the GMS packages. */
-  for (const auto &item :
-       json.value("riskyPackageCache", nlohmann::json::array()))
-    if (item.is_string())
-      facts.gms_connected.insert(item.get<std::string>());
-
-  {
-    std::size_t entries = 0;
-
-    for (const auto &[name, list] : presets)
-      entries += list.size();
-    Log::info("preset cache: {} ({} preset(s), {} entr(ies))", cache.string(),
-              presets.size(), entries);
-  }
-  return presets;
-}
-
 /* Where installed code lives; the same root the watcher reports events from. */
 constexpr std::string_view kAppRoot = "/data/app";
 /* The kernel takes this many caller code dirs. */
