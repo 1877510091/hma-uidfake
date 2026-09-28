@@ -21,6 +21,7 @@
  * linux/security.h.
  */
 #ifndef UIDFAKE_HOST_BUILD
+struct cred;
 extern void security_cred_getsecid(const struct cred *cred, u32 *secid);
 #endif
 #include <linux/slab.h>

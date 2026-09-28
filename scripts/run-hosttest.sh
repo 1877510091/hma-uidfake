@@ -15,21 +15,37 @@ cc -O1 -g -I src -I scripts/hosttest -I src/include -o "$out" scripts/policy_hos
 "$out"
 
 abx=build/abx_reader_test
-c++ -std=c++23 -O1 -I src/tools -o "$abx" scripts/abx_reader_test.cpp src/tools/abx.cpp
+clang++ -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference -Wdouble-promotion -Wformat=2 -I src/tools -o "$abx" scripts/abx_reader_test.cpp src/tools/abx.cpp
 "$abx"
 
 paths=build/rule_sources_test
-c++ -std=c++23 -O1 -I src/tools -o "$paths" scripts/rule_sources_test.cpp src/tools/paths.cpp
+clang++ -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference -Wdouble-promotion -Wformat=2 -I src/tools -o "$paths" scripts/rule_sources_test.cpp src/tools/paths.cpp
 "$paths" build/rule_sources_test.d
 
 # Both rule formats: what each one does with the same package list, driven with configs instead of
 # a device.
 paging=build/paging_test
-c++ -std=c++23 -O1 -I src/tools -o "$paging" scripts/paging_test.cpp src/tools/paging.cpp -lz
+clang++ -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference -Wdouble-promotion -Wformat=2 -I src/tools -o "$paging" scripts/paging_test.cpp src/tools/paging.cpp -lz
 "$paging"
 
 rules=build/rules_test
-c++ -std=c++23 -O1 -I src/tools -o "$rules" scripts/rules_test.cpp src/tools/rules.cpp \
+clang++ -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference -Wdouble-promotion -Wformat=2 -I src/tools -o "$rules" scripts/rules_test.cpp src/tools/rules.cpp \
   src/tools/preset_rules.cpp \
   src/tools/paths.cpp src/tools/packages.cpp src/tools/abx.cpp
 "$rules"
+
+# Same sources, one more round under ASan/UBSan: a proxy outliving its owner is not
+# a warning, it is a fault the first time it runs.
+
+clang++ -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference -Wdouble-promotion -Wformat=2 -I src/tools -o "$abx" scripts/abx_reader_test.cpp src/tools/abx.cpp
+clang++ -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference -Wdouble-promotion -Wformat=2 -I src/tools -o "$paths" scripts/rule_sources_test.cpp src/tools/paths.cpp
+clang++ -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference -Wdouble-promotion -Wformat=2 -I src/tools -o "$paging" scripts/paging_test.cpp src/tools/paging.cpp -lz
+clang++ -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference -Wdouble-promotion -Wformat=2 -I src/tools -o "$rules" scripts/rules_test.cpp src/tools/rules.cpp \
+  src/tools/preset_rules.cpp \
+  src/tools/paths.cpp src/tools/packages.cpp src/tools/abx.cpp
+"$abx"
+"$paths"
+"$paging"
+"$rules"
+
+

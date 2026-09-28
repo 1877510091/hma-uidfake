@@ -77,7 +77,7 @@ starts_with_any(std::string_view value,
   if (!in)
     return false;
   in.seekg((std::streamoff)from);
-  std::vector<char> data((std::size_t)(size - from));
+  std::vector<char> data(size - from);
   in.read(data.data(), (std::streamsize)data.size());
   const auto got = (std::size_t)in.gcount();
   return std::string_view{data.data(), got}.find(entry) !=

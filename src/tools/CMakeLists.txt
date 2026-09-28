@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(uidfake-tools LANGUAGES CXX)
 
+add_compile_options(-Wall)
+
 # sync-tool: one process that watches HMA's config, evaluates it and pushes the
 # resulting policy to the kernel over netlink.
 
