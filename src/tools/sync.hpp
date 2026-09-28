@@ -89,6 +89,7 @@ private:
   std::optional<PackageDb> packages_;
   PackageStamp packages_stamp_;
   bool config_refused_ = false;
+  bool users_refused_ = false;
   NetlinkClient netlink_;
   Watcher watcher_;
   /* The callers of the current policy: package name -> uid, and where their

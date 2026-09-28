@@ -160,6 +160,20 @@ void Syncer::sync_now(std::string_view why) {
   if (!file)
     return; /* it went away between the check and the read */
 
+  const auto users = android_users();
+  if (!users) {
+    if (!users_refused_) {
+      users_refused_ = true;
+      Log::warn("user list is not readable yet (keeping the previous policy)");
+    }
+    watcher_.arm_retry();
+    return;
+  }
+  if (users_refused_) {
+    users_refused_ = false;
+    Log::info("user list readable again");
+  }
+
   const auto opened = open_rules(*file, *packages);
   if (!opened)
     return;
@@ -169,7 +183,7 @@ void Syncer::sync_now(std::string_view why) {
 
   /* The rules are per package, so every user answers
    * for its own uids. */
-  pairs = expand_users(pairs, android_users());
+  pairs = expand_users(pairs, *users);
   std::ranges::sort(pairs, [](const Pair &a, const Pair &b) {
     return a.caller != b.caller ? a.caller < b.caller : a.target < b.target;
   });
@@ -545,10 +559,12 @@ void Syncer::template_for(std::string_view caller, bool write) {
 bool Syncer::run() {
   sync_now();
   if (config_.once)
-    return true;
+    return !users_refused_;
 
   if (!watcher_.open(sources_))
     return false;
+  if (users_refused_)
+    watcher_.arm_retry();
   if (const auto active = RuleSource::active(sources_)) {
     if (const auto file = active->config())
       Log::info("watching {}", file->string());

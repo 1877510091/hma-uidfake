@@ -3,6 +3,7 @@
 // driven with configs instead of a device.
 #include "rules.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -95,6 +96,31 @@ constexpr auto kHmaOssConfig = R"({
   }
 })";
 
+void test_user_ids()
+{
+	const auto user0 = uidfake::parse_user_id("0");
+	const auto user10 = uidfake::parse_user_id("10");
+	check(user0 && *user0 == 0, true, "users: accept primary user 0");
+	check(user10 && *user10 == 10, true, "users: accept secondary user");
+	check(!uidfake::parse_user_id(""), true, "users: reject empty name");
+	check(!uidfake::parse_user_id("user10"), true,
+	      "users: reject non-numeric name");
+	check(!uidfake::parse_user_id("4294967296"), true,
+	      "users: reject oversized name");
+
+	const uidfake::Pairs base{ uidfake::Pair{ .caller = 10566,
+						  .target = 10327 } };
+	const auto expanded = uidfake::expand_users(base, { 0, 10 });
+	check(expanded.size() == 2, true, "users: expand both users");
+	check(std::ranges::contains(expanded, uidfake::Pair{ .caller = 10566,
+							     .target = 10327 }),
+	      true, "users: keep primary-user pair");
+	check(std::ranges::contains(expanded,
+				    uidfake::Pair{ .caller = 1010566,
+						   .target = 1010327 }),
+	      true, "users: add secondary-user pair");
+}
+
 /* Read the real cache loader, rather than supplying only hand-built sets. */
 void test_preset_cache()
 {
@@ -156,6 +182,7 @@ void test_preset_cache()
 
 int main()
 {
+	test_user_ids();
 	test_preset_cache();
 	const auto hma_path = write_config("rules_hma.json", kHmaConfig);
 	const auto oss_path = write_config("rules_oss.json", kHmaOssConfig);

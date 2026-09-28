@@ -41,6 +41,24 @@ constexpr std::string_view kFlags = "flags";
   return true;
 }
 
+} // namespace
+
+std::optional<std::uint32_t> parse_user_id(std::string_view text) {
+  if (text.empty() || text.size() > 10)
+    return std::nullopt;
+  std::uint64_t value = 0;
+  for (const char c : text) {
+    if (c < '0' || c > '9')
+      return std::nullopt;
+    value = value * 10 + static_cast<std::uint64_t>(c - '0');
+  }
+  if (value >= (1ULL << 31))
+    return std::nullopt;
+  return static_cast<std::uint32_t>(value);
+}
+
+namespace {
+
 [[nodiscard]] bool system_partition(std::string_view path) {
   for (const std::string_view prefix : {"/system/", "/system_ext/", "/product/",
                                         "/vendor/", "/odm/", "/apex/"}) {
@@ -209,23 +227,26 @@ PackageDb::code_dir_of(std::string_view name) const {
 }
 
 /* The users this device has: the directory names under /data/system/users are
- * the ids. A device without that directory is user 0. */
-std::vector<std::uint32_t> android_users() {
+ * the ids. A failed or partial listing is not a usable user set. */
+std::optional<std::vector<std::uint32_t>> android_users() {
   std::vector<std::uint32_t> users;
   std::error_code ec;
-  for (const auto &entry :
-       std::filesystem::directory_iterator{"/data/system/users", ec}) {
+  std::filesystem::directory_iterator it{"/data/system/users", ec};
+  if (ec)
+    return std::nullopt;
+
+  const std::filesystem::directory_iterator end;
+  for (; it != end; it.increment(ec)) {
     if (ec)
-      break;
-    std::uint32_t user = 0;
-    if (parse_number(entry.path().filename().string(), user))
-      users.push_back(user);
+      return std::nullopt;
+    if (const auto user = parse_user_id(it->path().filename().string()))
+      users.push_back(*user);
   }
+  if (ec || users.empty())
+    return std::nullopt;
+
   std::ranges::sort(users);
-  if (users.empty()) {
-    Log::warn("cannot list /data/system/users; assuming user 0");
-    users.push_back(0);
-  }
+  users.erase(std::ranges::unique(users).begin(), users.end());
   return users;
 }
 

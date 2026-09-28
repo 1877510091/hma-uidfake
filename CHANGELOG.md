@@ -8,6 +8,14 @@
   /data/system/users and writes every pair once per user, each with the replacement its own bucket
   needs.
 
+- The user ids are read on their own terms: the directory names under /data/system/users went
+  through the parser written for uids, and that one rejects 0, so a device with a work profile
+  wrote the work profile's pairs and dropped the primary user's -- the case above, still open.
+  A listing that cannot be opened, stops half way or comes back empty is not a user set either:
+  the previous policy is kept and the sync retries until it reads one (/data may still be
+  encrypted at boot), and --once reports the failure instead of a success. A regression test
+  covers user 0 beside a secondary user.
+
 - The policy is published without a lock: the spinlock that was taken with interrupts off around it
   guarded a single pointer assignment, which is an atomic exchange by itself.
 - The staged upload takes one, on the other hand: three commands write the same buffer and nothing

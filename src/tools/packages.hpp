@@ -57,7 +57,8 @@ private:
 
 /* HMA's rules are per package, not per user: an app hidden from another is
  * hidden in every user, and uid(user) = uid(user 0) + user * 100000. */
-[[nodiscard]] std::vector<std::uint32_t> android_users();
+[[nodiscard]] std::optional<std::uint32_t> parse_user_id(std::string_view text);
+[[nodiscard]] std::optional<std::vector<std::uint32_t>> android_users();
 [[nodiscard]] Pairs expand_users(const Pairs &pairs,
                                  const std::vector<std::uint32_t> &users);
 
