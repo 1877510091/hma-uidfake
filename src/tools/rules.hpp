@@ -60,6 +60,10 @@ struct PresetFacts {
   Presets scanned;
 };
 
+/* Read HMA-OSS's exported preset membership beside its config file. */
+[[nodiscard]] Presets
+load_preset_cache(const std::filesystem::path &config_file, PresetFacts &facts);
+
 class Rules {
 public:
   virtual ~Rules() = default;
