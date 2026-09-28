@@ -15,6 +15,7 @@
 #include <asm/cacheflush.h>
 #include <asm/pgtable.h>
 #include <linux/kprobes.h>
+#include <linux/version.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/stop_machine.h>
@@ -28,23 +29,129 @@ static int probe_noop(struct kprobe *p, struct pt_regs *r)
 }
 
 /*
- * Look up a kernel symbol by name. kallsyms_lookup_name() is not exported to
- * modules, so its own address is obtained from a probe registered on it (kprobe
- * resolves .symbol_name through kallsyms internally) and unregistered
- * immediately -- nothing stays behind. This is how KernelSU resolves symbols
- * too.
+ * Symbol lookup, the way KernelSU does it on arm64: resolve a name through
+ * kallsyms, accept the CFI jump-table variant of it as well (that is what a call
+ * site reaches on a CFI kernel), and fall back to walking the whole kallsyms
+ * table when kallsyms_lookup_name() cannot be had. Nothing here reads an offset
+ * out of a function body.
+ *
+ * kallsyms_lookup_name() and kallsyms_on_each_symbol() are not exported to
+ * modules, so their own addresses come from a probe registered on them -- kprobe
+ * resolves .symbol_name through kallsyms internally -- unregistered immediately,
+ * so nothing stays behind.
  */
-unsigned long uidfake_lookup(const char *name)
+static unsigned long lookup_exported(const char *symbol)
 {
-	struct kprobe kp = { .symbol_name = "kallsyms_lookup_name",
-			     .pre_handler = probe_noop };
-	unsigned long (*fn)(const char *);
+	struct kprobe kp = { .symbol_name = symbol, .pre_handler = probe_noop };
+	unsigned long addr;
 
 	if (register_kprobe(&kp))
 		return 0;
+	addr = (unsigned long)kp.addr;
 	unregister_kprobe(&kp);
-	fn = (void *)kp.addr;
+	return addr;
+}
+
+static unsigned long lookup_name(const char *name)
+{
+	unsigned long (*fn)(const char *) =
+		(void *)lookup_exported("kallsyms_lookup_name");
+
 	return fn ? fn(name) : 0;
+}
+
+struct find_ctx {
+	const char *name;
+	unsigned long addr;
+	unsigned long next; /* the following symbol: where the body ends */
+};
+
+/*
+ * The walk has to see every symbol: the one after a match is the end of it, so it
+ * cannot stop at the match itself.
+ */
+static int find_symbol_cb(void *data, const char *name, unsigned long addr)
+{
+	struct find_ctx *ctx = data;
+
+	if (ctx->addr && addr > ctx->addr && (!ctx->next || addr < ctx->next))
+		ctx->next = addr;
+	if (!ctx->addr && name && strcmp(name, ctx->name) == 0)
+		ctx->addr = addr;
+	return 0;
+}
+
+/* For kernels before 6.6 the callback carries the module a symbol came from: a
+ * module may shadow a name, so those are skipped. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+static int find_symbol_cb_mod(void *data, const char *name, struct module *mod,
+			      unsigned long addr)
+{
+	if (mod)
+		return 0;
+	return find_symbol_cb(data, name, addr);
+}
+#endif
+
+static void find_symbol(const char *name, struct find_ctx *ctx)
+{
+	int (*walk)(void *, int (*)(void *, const char *, unsigned long),
+		    void *) =
+		(void *)lookup_exported("kallsyms_on_each_symbol");
+
+	ctx->name = name;
+	ctx->addr = 0;
+	ctx->next = 0;
+	if (!walk)
+		return;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+	walk(ctx, find_symbol_cb, NULL);
+#else
+	/*
+	 * The older signature takes the callback with the module argument, so it is
+	 * called through a small shim with the same shape.
+	 */
+	{
+		int (*old)(void *,
+			   int (*)(void *, const char *, struct module *,
+				   unsigned long),
+			   void *) = (void *)walk;
+
+		old(ctx, find_symbol_cb_mod, NULL);
+	}
+#endif
+}
+
+unsigned long uidfake_lookup(const char *name)
+{
+	unsigned long addr = lookup_name(name);
+	char dotted[KSYM_NAME_LEN + 16];
+
+	if (addr)
+		return addr;
+
+	/* The CFI variant: selinux_setprocattr becomes selinux_setprocattr..cfi_jt. */
+	if (!strchr(name, '.') && snprintf(dotted, sizeof(dotted), "%s..cfi_jt",
+					   name) < (int)sizeof(dotted)) {
+		addr = lookup_name(dotted);
+		if (addr)
+			return addr;
+	}
+
+	{
+		struct find_ctx ctx;
+
+		find_symbol(name, &ctx);
+		return ctx.addr;
+	}
+}
+
+unsigned long uidfake_lookup_end(const char *name)
+{
+	struct find_ctx ctx;
+
+	find_symbol(name, &ctx);
+	return ctx.next;
 }
 
 /*
@@ -53,12 +160,21 @@ unsigned long uidfake_lookup(const char *name)
  * transient-probe resolver.
  */
 static struct mm_struct *patch_mm;
+
+/* [_stext, _end): the only range this module is willing to write into. */
+static unsigned long g_text_start;
+static unsigned long g_text_end;
 static unsigned long *g_kimage_voffset;
 static bool g_walk_warned;
 static unsigned long *g_memstart_addr;
 
 int uidfake_patch_init(void)
 {
+	/* The kernel's own extent: every patch target has to be inside it, or the
+	 * write would land somewhere it has no business being. */
+	g_text_start = uidfake_lookup("_stext");
+	g_text_end = uidfake_lookup("_end");
+
 	patch_mm = (struct mm_struct *)uidfake_lookup("init_mm");
 	g_kimage_voffset = (unsigned long *)uidfake_lookup("kimage_voffset");
 	g_memstart_addr = (unsigned long *)uidfake_lookup("memstart_addr");
@@ -163,12 +279,30 @@ static void cache_clean_inval(void *addr, size_t len)
  */
 static phys_addr_t image_phys(unsigned long addr)
 {
+	phys_addr_t base, end, pa;
+	unsigned long voff;
+
 	if (g_kimage_voffset)
-		return (phys_addr_t)(addr - *g_kimage_voffset);
-	if (g_memstart_addr)
-		return (phys_addr_t)(addr - (unsigned long)(KIMAGE_VADDR -
-							    *g_memstart_addr));
-	return 0;
+		voff = *g_kimage_voffset;
+	else if (g_memstart_addr)
+		voff = (unsigned long)(KIMAGE_VADDR - *g_memstart_addr);
+	else
+		return 0;
+
+	pa = (phys_addr_t)(addr - voff);
+	/*
+	 * The offset has to put the target inside the image's own physical extent.
+	 * When it does not -- a vendor kernel whose kimage_voffset this module did
+	 * not read correctly, or an mm_struct that is not the tree's -- the write
+	 * would land on an unrelated page, so it is refused instead.
+	 */
+	if (!g_text_start || !g_text_end)
+		return 0;
+	base = (phys_addr_t)(g_text_start - voff);
+	end = (phys_addr_t)(g_text_end - voff);
+	if (pa < base || pa >= end)
+		return 0;
+	return pa;
 }
 
 static struct page *page_for(unsigned long addr, unsigned long *off)
@@ -218,6 +352,15 @@ int uidfake_patch_text(void *dst, const void *src, size_t len, bool sync)
 
 	if (!len || (unsigned long)dst & 3 || len & 3)
 		return -EINVAL;
+	/* Refuse anything outside the kernel image before a single byte is written:
+	 * a wrong physical address used to be caught only by reading the target
+	 * back, which is too late -- the stray write has already happened. */
+	if (!g_text_start || !g_text_end || (unsigned long)dst < g_text_start ||
+	    (unsigned long)dst + len > g_text_end) {
+		pr_warn("uidfake: refusing to patch %px: outside the kernel image\n",
+			dst);
+		return -EPERM;
+	}
 	if (offset_in_page((unsigned long)dst) + len > PAGE_SIZE)
 		return -EINVAL;
 
