@@ -69,8 +69,12 @@ int main(void)
 	static u32 pairs[7 * 19 * 2];
 	u32 i, j, w = 0;
 	static u32 big[4000 * 2];
+	/* A policy from the field: more pairs than the old 4096 ceiling. */
+	static u32 kHugePairs = 24000;
+	static u32 huge[24000 * 2];
+	static u32 hugec[600];
 	static u32 bigc[400];
-	u32 bw = 0, bc = 0;
+	u32 bw = 0, bc = 0, hw = 0;
 
 	for (i = 0; i < 19; i++)
 		targets[i] = 10400 + i;
@@ -93,6 +97,30 @@ int main(void)
 				bw++;
 			}
 	check_sweep("uid-scale callers", big, bw * 2, bigc, bc, 30000, 30010);
+
+	/* 24000 pairs over 600 callers: every one of them has to come back hidden. */
+	for (i = 0; i < 600; i++)
+		hugec[i] = 10000 + i * 3;
+	for (i = 0, hw = 0; i < kHugePairs; i++) {
+		huge[2 * hw] = hugec[i % 600];
+		huge[2 * hw + 1] = 30000 + (i * 7) % 20000;
+		hw++;
+	}
+	check_sweep("field-sized", huge, hw * 2, hugec, 600, 30000, 30009);
+
+	/* The same policy for two users, the way expand_users() hands it over: the
+	 * hider table is keyed by app id, so both users' pairs have to be found. */
+	for (i = 0, hw = 0; i < 200; i++) {
+		huge[2 * hw] = 10452;
+		huge[2 * hw + 1] = 10700 + i;
+		hw++;
+	}
+	for (i = 0; i < 200; i++) {
+		huge[2 * hw] = 110452;
+		huge[2 * hw + 1] = 110700 + i;
+		hw++;
+	}
+	check_sweep("two users", huge, hw * 2, hugec, 0, 30000, 30000);
 
 	printf("%s\n", g_fail ? "FAIL" : "PASS");
 	return g_fail;

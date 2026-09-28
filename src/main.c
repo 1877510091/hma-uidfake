@@ -15,7 +15,11 @@ static DECLARE_DELAYED_WORK(uidfake_debug_work, uidfake_debug_off);
 
 /* The parameter is a one-shot: it arms the key and the work item disarms it a
  * minute later. */
+#ifdef UF_DEBUG_ALWAYS
+static bool uidfake_debug = true;
+#else
 static bool uidfake_debug;
+#endif
 module_param_named(debug, uidfake_debug, bool, 0644);
 MODULE_PARM_DESC(debug,
 		 "log the isolated-child naming for 60 seconds after load");
@@ -34,8 +38,13 @@ void uidfake_debug_init(bool on)
 	if (!on)
 		return;
 	static_branch_enable(&uidfake_debug_key);
+#ifdef UF_DEBUG_ALWAYS
+	pr_info("uidfake: diagnostics on (compiled in, they never turn off)");
+	return;
+#else
 	pr_info("uidfake: diagnostics on for 60 s\n");
 	schedule_delayed_work(&uidfake_debug_work, 60UL * HZ);
+#endif
 }
 
 static int __init uidfake_init(void)

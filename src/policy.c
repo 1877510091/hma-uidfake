@@ -248,12 +248,19 @@ struct layout {
 
 /* distinct callers of the policy -> dense hider ids; -1 if there are too many
  */
+/*
+ * The hider table: one id per app, never per uid. A policy carries every user's
+ * uids -- the tool expands them -- and both lookups (the tag one and
+ * policy_lookup_as) identify the caller by the app id inside its uid, so keying
+ * this by the full uid would leave the first user's masks under an id nobody
+ * asks for, and that user's pairs would simply not be hidden.
+ */
 static int build_hiders(struct apply_pair *p, u32 n, u32 *hid)
 {
 	u32 i, j, nh = 0;
 
 	for (i = 0; i < n; i++) {
-		u32 c = p[i].caller;
+		u32 c = p[i].caller % 100000u;
 
 		if (c == 0) /* caller==0 hides from everyone, no id needed */
 			continue;
@@ -408,7 +415,7 @@ static int layout_targets(struct layout *l, struct apply_pair *p, u32 n,
 		goto fail;
 
 	for (i = 0; i < n; i++) {
-		u32 t = p[i].target, c = p[i].caller;
+		u32 t = p[i].target, c = p[i].caller, app;
 		u64 *m;
 
 		if (i && p[i - 1].target == t) {
@@ -443,12 +450,19 @@ static int layout_targets(struct layout *l, struct apply_pair *p, u32 n,
 			m = &masks[last * l->nmask_words];
 		}
 
-		if (c == 0) {
+		/*
+		 * The hider table is keyed by app id, not by uid: a policy carries
+		 * every user's uids and the lookups identify the caller by the app
+		 * id inside its uid, so comparing the full uid here would leave the
+		 * second user's pairs with no mask bit at all.
+		 */
+		app = c % 100000u;
+		if (app == 0) {
 			tgt[last].repl_k |= POLICY_WILD_FLAG;
 			continue;
 		}
 		for (j = 0; j < nh; j++)
-			if (hid[j] == c)
+			if (hid[j] == app)
 				break;
 		if (j < nh)
 			m[j >> 6] |= 1ULL << (j & 63);
@@ -575,6 +589,13 @@ void policy_apply(const u32 *pairs, u32 npairs)
 		/* answer every configured pair from the table that is now live */
 		for (i = 0; i < n; i++) {
 			if (tmp[i].caller == 0)
+				continue;
+			/*
+			 * A caller asking about itself is answered 0 by the hot path on
+			 * purpose, and the tool never emits such a pair: counting it here
+			 * would report a policy that is in fact complete as broken.
+			 */
+			if (tmp[i].caller % 100000u == tmp[i].target % 100000u)
 				continue;
 			checked++;
 			if (policy_lookup_as((uid_t)tmp[i].caller,

@@ -34,7 +34,7 @@ public:
 
   /* The kernel holds at most POLICY_MAX_PAIRS pairs (src/include/uidfake.h),
    * and one page carries kPagePairs of them. */
-  static constexpr std::size_t kMaxPairs = 4096;
+  static constexpr std::size_t kMaxPairs = 65536;
 
   /* Replaces the kernel's policy with `pairs` (an empty list clears it).
    * Failures are logged; false means the kernel side is not reachable yet. */

@@ -8,7 +8,8 @@
 #include <linux/types.h>
 #include <linux/uidgid.h>
 
-#define POLICY_MAX_PAIRS 4096
+#define POLICY_MAX_PAIRS \
+	65536 /* 23k+ pairs appeared in the field: see the host test */
 
 /*
  * Two tables. The target table is read on every query and is indexed like the
@@ -22,7 +23,8 @@
 #define POLICY_WAY 8 /* target slots per 64-byte line */
 #define POLICY_CLINE_WAY 8 /* caller slots per 64-byte line */
 #define POLICY_MIN_LINES 16
-#define POLICY_MAX_LINES 4096
+#define POLICY_MAX_LINES \
+	32768 /* 8 slots a line, so this covers ~260k targets */
 #define POLICY_MAX_CALLERS 4096
 #define POLICY_REPL_BITS 12
 #define POLICY_REPL_BASE 0x40000000u
@@ -104,6 +106,13 @@ void hooks_remove(void);
 int uidfake_patch_text(void *dst, const void *src, size_t len, bool sync);
 int uidfake_patch_init(void);
 unsigned long uidfake_lookup(const char *name);
+
+/*
+ * The address just past that symbol: the end of its body in kallsyms, which is
+ * what a scan for a call site inside it has to stay within. Zero when the symbol
+ * or its follower is unknown.
+ */
+unsigned long uidfake_lookup_end(const char *name);
 
 /*
  * aarch64 branch helpers, kept inline so the host test can check the encoder: a

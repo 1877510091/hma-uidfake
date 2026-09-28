@@ -15,8 +15,6 @@
 #include <linux/uidgid.h>
 #include <linux/user.h>
 
-#include <trace/hooks/syscall_check.h>
-
 #include "uidfake.h"
 
 /* The window is closed from the query path too (see uidfake_close_pending). */
@@ -69,7 +67,7 @@ static asmlinkage long uidfake_setresgid(const struct pt_regs *regs);
 
 /* Names an isolated child when it opens its app's apk; registered as a vendor
  * hook. */
-static void uidfake_file_open(void *data, const struct file *file);
+static void uidfake_file_open(const struct file *file);
 
 static asmlinkage long uidfake32_setuid(const struct pt_regs *regs);
 static asmlinkage long uidfake32_setreuid(const struct pt_regs *regs);
@@ -77,6 +75,10 @@ static asmlinkage long uidfake32_setresuid(const struct pt_regs *regs);
 static asmlinkage long uidfake32_setgid(const struct pt_regs *regs);
 static asmlinkage long uidfake32_setregid(const struct pt_regs *regs);
 static asmlinkage long uidfake32_setresgid(const struct pt_regs *regs);
+
+/* Both tables get openat: it is how a loader hands a process its code. */
+static asmlinkage long uidfake_openat(const struct pt_regs *regs);
+static asmlinkage long uidfake32_openat(const struct pt_regs *regs);
 
 static struct hook_entry g_hook[] = {
 	{ __NR_getpriority, uidfake_getpriority, NULL },
@@ -89,6 +91,7 @@ static struct hook_entry g_hook[] = {
 	{ __NR_setgid, uidfake_setgid, NULL },
 	{ __NR_setregid, uidfake_setregid, NULL },
 	{ __NR_setresgid, uidfake_setresgid, NULL },
+	{ __NR_openat, uidfake_openat, NULL },
 };
 
 /*
@@ -126,7 +129,12 @@ static struct hook_entry g_chook[] = {
 	{ NR32_SETGID, uidfake32_setgid, NULL },
 	{ NR32_SETREGID, uidfake32_setregid, NULL },
 	{ NR32_SETRESGID, uidfake32_setresgid, NULL },
+	{ NR32_OPENAT, uidfake32_openat, NULL },
 };
+
+/* Appended, so the indices the uid wrappers read their orig from stay put. */
+#define HOOK_OPENAT_IDX (ARRAY_SIZE(g_hook) - 1)
+#define CHOOK_OPENAT_IDX (ARRAY_SIZE(g_chook) - 1)
 
 #endif
 
@@ -316,14 +324,13 @@ static noinline void uidfake_close_unheard(const struct file *file, u32 dev,
 		(unsigned long)file_inode(file)->i_ino, dev, depth);
 }
 
-static void uidfake_file_open(void *data, const struct file *file)
+static void uidfake_file_open(const struct file *file)
 {
 	const struct inode *inode = file_inode(file);
 	const struct dentry *dentry;
 	u32 tag = 0;
 	int depth = 0;
 
-	(void)data;
 	if (!uidfake_tag_pending())
 		return;
 
@@ -359,6 +366,59 @@ static void uidfake_file_open(void *data, const struct file *file)
 		uidfake_tag_close();
 	}
 }
+
+/*
+ * The naming, from an fd: fdget() takes the reference without the atomic a counted
+ * lookup would cost, and the dentry chain the file already carries is what
+ * uidfake_file_open() walks. It runs after the syscall, never before: a table entry
+ * may not sleep, and walking the path the kernel is about to walk means a
+ * kern_path() there.
+ */
+static noinline void uidfake_openat_file(int fd)
+{
+	struct file *file;
+	struct fd f = fdget(fd);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+	file = fd_file(f);
+#else
+	file = f.file;
+#endif
+	if (file)
+		uidfake_file_open(file);
+	fdput(f);
+}
+
+static asmlinkage long uidfake_openat(const struct pt_regs *regs)
+{
+	long ret;
+
+	/*
+	 * A task that is not waiting for a name pays one AND and calls the original,
+	 * and only a successful return names anything.
+	 */
+	if (!uidfake_tag_pending())
+		return g_hook[HOOK_OPENAT_IDX].orig(regs);
+	ret = g_hook[HOOK_OPENAT_IDX].orig(regs);
+	if (ret >= 0)
+		uidfake_openat_file((int)ret);
+	return ret;
+}
+
+#ifdef CONFIG_COMPAT
+/* The same for a 32-bit process: compat_sys_call_table[322]. */
+static asmlinkage long uidfake32_openat(const struct pt_regs *regs)
+{
+	long ret;
+
+	if (!uidfake_tag_pending())
+		return g_chook[CHOOK_OPENAT_IDX].orig(regs);
+	ret = g_chook[CHOOK_OPENAT_IDX].orig(regs);
+	if (ret >= 0)
+		uidfake_openat_file((int)ret);
+	return ret;
+}
+#endif
 
 /* ---- table patching ---- */
 
@@ -454,8 +514,6 @@ int hooks_install(void)
      * The vendor hook covers every open path, not just openat, and keeps
      * sys_call_table down to the uid syscalls.
      */
-		register_trace_android_vh_check_file_open(uidfake_file_open,
-							  NULL);
 		uidfake_tag_prime(); /* give the processes that already run their tag */
 		return 1;
 	}
@@ -470,7 +528,6 @@ void hooks_remove(void)
 	if (!main_table)
 		return;
 
-	unregister_trace_android_vh_check_file_open(uidfake_file_open, NULL);
 	unpatch_entries(main_table, g_hook, ARRAY_SIZE(g_hook));
 #ifdef CONFIG_COMPAT
 	unpatch_entries(compat_table, g_chook, ARRAY_SIZE(g_chook));
