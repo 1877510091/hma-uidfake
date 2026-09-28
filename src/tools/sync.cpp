@@ -147,9 +147,22 @@ Syncer::open_rules(const std::filesystem::path &file,
   Presets presets;
   if (rules->uses_presets()) {
     presets = load_preset_cache(file, facts);
-    /* The app rebuilds its own presets per process from a view its hooks
-     * filter, so the scanned half is computed here instead. */
-    facts.scanned = scan_presets(packages);
+
+    /*
+     * The cache is what the app exported, and on any device that has it, it is
+     * complete. Scanning is the fallback for a cache that is missing or
+     * partial, and it is not free: it reads every installed apk. Only the
+     * presets the config applies and the cache did not have are scanned for.
+     */
+    std::set<std::string, std::less<>> missing;
+    for (const auto &name : rules->presets_in_use())
+      if (!presets.contains(name))
+        missing.insert(name);
+    if (!missing.empty()) {
+      Log::info("presets not in the cache, reading the apks for {} of them",
+                missing.size());
+      facts.scanned = scan_presets(packages, missing);
+    }
   }
   rules->set_preset_facts(std::move(facts));
   return OpenedRules{.rules = std::move(rules), .presets = std::move(presets)};
@@ -256,15 +269,52 @@ void Syncer::sync_now(std::string_view why) {
 
 void Syncer::publish_code_dirs() {
   std::vector<ApkEntry> entries;
+  std::size_t outside = 0;
   entries.reserve(callers_.size());
-  /* One entry per directory, even when several
-   * packages share a uid. */
+  /* One entry per directory, even when several packages share a uid. */
   std::set<std::pair<std::uint32_t, std::uint64_t>> seen;
 
-  for (const auto &[name, uid] : callers_) {
-    const auto dir = code_dirs_.find(name);
+  /*
+   * Every installed app, not only the callers: the table is what lets the
+   * kernel name an isolated process by the apk it opens, and its host is
+   * whatever app spawned it -- a WebView renderer, a renderer service,
+   * anything. The callers go in first, so a table that hits the cap still
+   * carries the ones the policy needs.
+   */
+  std::vector<std::pair<std::string, std::uint32_t>> wanted;
+  wanted.reserve(packages_ ? packages_->by_name().size() : callers_.size());
+  for (const auto &[name, uid] : callers_)
+    wanted.emplace_back(name, uid);
+  if (packages_) {
+    for (const auto &[name, info] : packages_->by_name()) {
+      if (info.uid < kFirstAppUid || callers_.contains(name))
+        continue;
+      wanted.emplace_back(name, info.uid);
+    }
+  }
+
+  for (const auto &[name, uid] : wanted) {
+    auto dir = code_dirs_.find(name);
+    if (dir == code_dirs_.end() && packages_) {
+      /* Not a caller: its directory comes straight from the package database.
+       */
+      if (const auto own = packages_->code_dir_of(name)) {
+        code_dirs_.insert_or_assign(name, *own);
+        dir = code_dirs_.find(name);
+      }
+    }
     if (dir == code_dirs_.end())
       continue;
+    /*
+     * Only the tree installed code lives in. An entry on another partition --
+     * a system app's apk, a library under /apex -- puts that whole filesystem
+     * into the kernel's set, and then any file the framework reads from it ends
+     * a child's wait long before its own code is anywhere near running.
+     */
+    if (!dir->second.lexically_normal().string().starts_with(kAppRoot)) {
+      ++outside;
+      continue;
+    }
     struct stat info{};
     if (::stat(dir->second.c_str(), &info) != 0)
       continue;
@@ -288,6 +338,8 @@ void Syncer::publish_code_dirs() {
     return;
   }
   published_.assign(entries.begin(), entries.end());
+  if (outside != 0)
+    Log::info("{} code dir(s) outside {} skipped", outside, kAppRoot);
   Log::info("registered {} caller code dir(s)", entries.size());
 }
 
