@@ -14,6 +14,21 @@
   serialised them. A second sender could only produce a policy whose CRC does not check out -- refused
   rather than half applied -- but a mutex keeps them from fighting over it.
 
+
+- The presets a config applies follow the app line for line. The rules its own code computes
+  (`canBeAddedIntoPreset`) were only partly copied here, so a package the app hides could be one this
+  side did not count -- a uid hidden in userspace and still answered by the kernel. `sus_apps` by
+  `com.termux` and the apk editor assets, `root_apps` by the viper, busybox, magisk and apatch names,
+  the kernel manager libraries and the old `ACCESS_SUPERUSER` permission, `accessibility_apps` by its
+  permission and never for a system app, `shizuku` by the provider it declares, `xposed` by the entry
+  it carries or by being the app itself, `custom_rom` by the full overlay prefix list. A binary
+  manifest keeps its strings in UTF-16, so one search looks for both forms: two checks that looked
+  for bytes could never have matched on a device.
+- Permissions are read from `/data/system/packages.xml` (`<perms>`) as well, and either source is
+  enough.
+- A regression test holds 25 cases, each naming the line of the app it stands for, and runs with the
+  host tests in both rounds (plain and under ASan).
+
 ## 0.2.1
 
 - A policy is uploaded in pages and only becomes live when its last page and its CRC check out, so a
