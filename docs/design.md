@@ -9,24 +9,56 @@ from the birth tag rather than from the current uid -- one table load and a `cse
 uid cannot move a process into another set of rules. `/proc` and ptrace see the argument as the
 caller wrote it, and there is nothing to restore.
 
+A slot is patched only when the value in it is one this module resolved: the entry's own symbol, the
+64-bit implementation, the compat wrapper under either of its names, in both the plain and the
+jump-table spelling. The number a syscall has is a hint for the first comparison, never the thing
+that decides -- a wrong number would otherwise be a hook on someone else's syscall, which is what a
+32-bit getpriority used to be before this was a comparison.
+
 ## Naming an isolated child
 
 An isolated process gets its uid at birth and nothing else says which app it came from:
 
-1. **Birth.** When zygote hands an app uid to a fresh process, or `app_zygote` hands an isolated uid
-to one, the app id goes into bits 40..55 of `thread_info.flags` (zero = untagged), and an isolated
-child also gets a pending bit above that field, so the hot path tests both with one AND. The tag is
-never rewritten or cleared, and `fork()` copies it.
-2. **The first code file it opens.** While the pending bit is set, the vendor hook looks at
-consecutive opens until one lands on a filesystem an app's code lives on -- the framework's own
-startup reads properties, `/proc`, `/dev` and `/system`, none of which counts. From
-`file->f_path.dentry` it walks up at most four dentries comparing inodes against the registered
-caller code dirs; a hit names the whole thread group after that app, whichever file inside the
-directory was opened (apk, vdex, odex, library). A miss ends the wait for good.
+1. **Birth.** The id change is watched where the kernel commits it: `task_fix_setuid` is taken over
+   in the LSM hook list, chained into the implementation that was there (commoncap's on every kernel
+   this is built for). It is called for every uid change, 32-bit callers included, and hands over
+   both creds, so nothing has to be sampled around a call. When the framework gives an app uid to a
+   fresh process, or `app_zygote` gives an isolated uid to one, the app id goes into bits 40..53 of
+   `thread_info.flags` (zero = untagged) and an isolated child also gets a pending bit above that
+   field. A task that is named already is left alone: its name came from the one transition that
+   gave it its identity.
+2. **The first file of its code it opens.** The pending bit says a child is waiting. The base.apk of
+   every app that has rules has its `->open` replaced with a copy of the inode's
+   `file_operations` that differs in that one member, and the record behind the copy is the app id:
+   the first open of that file names the whole thread group, with no lookup and no walk. The inode is
+   held while its fields are read and only for that -- a path resolves to a dentry, not to a committed
+   inode, and the package manager frees the one it is replacing while the helper is still sending the
+   new one. Nothing is stored about the inode: a record keeps the numbers it was made for and the
+   table to put back, is never handed to another file, and carries this module as the owner of its
+   table -- so an open file keeps the module loaded and the table cannot be given back while one is
+   still using it. At unload each file is found again from the path it was registered with. The app
+   id is taken from inside the uid (`uid % 100000`), because a user id is the high part of it: read
+   as a whole number, an app of a secondary user looks like an isolated uid and would never be named.
 3. **Before the module loads.** `uidfake_tag_prime()` derives the same tag for every running task
-from its uid and the SELinux sid of its creds, the pair the zygote path writes. Without it a manual
-`rmmod`/`insmod` would lose the identity of every running app. That pair is also what the
-`setuid`-family hooks write, which is why they are hooked: `setuid()` cannot choose its rules.
+   from its uid. Without it a manual `rmmod`/`insmod` would lose the identity of every running app.
+
+## Patch writes
+
+The kernel text and rodata this touches are read-only, and nothing that makes them writable is
+exported to modules. The physical address of the target is translated with the image offset
+(`va - kimage_voffset`), the page is mapped through the kernel's own fixmap window, and the write
+goes through a nofault copy.
+
+- Every target is inside `[_stext, _end)`; anything else is refused before a byte is written.
+- The fixmap address depends on the VA size the kernel was built with, which is not always the one
+  this module was built with. Two candidates are tried, this build's and the one derived from the
+  kernel's own `vmemmap` (`FIXADDR_TOP = VMEMMAP_START - SZ_32M`), and each is proved before use:
+  the bytes at the alias have to be the bytes at the target. Neither proved means nothing is written.
+- The page table walk is a second opinion and is calibrated against the image offset once at load. A
+  kernel whose `struct mm_struct` or geometry is not this module's makes the walk answer with a
+  different page; the offset is the one that does not care, and it is what the write needs.
+- What was written is read back, and a hook that is no longer this module's is left alone on unload
+  rather than overwritten.
 
 ## Diagnostics
 
@@ -36,9 +68,12 @@ Diagnostics sit behind a static key (jump label): with the key off the branch is
 insmod hma_uidfake.ko debug=1        # for 60 seconds, then off again
 ```
 
-Only the two lines that report a real event are ungated (`iso birth uid ... marked`, `iso uid ...
-belongs to app ...`). The rest -- the devs treated as code, a directory an open reached with no rule
-for it, an untagged caller -- is what the parameter is for.
+What the module is doing is also readable where a user looks: `KAUX_CMD_STATUS` answers with the
+entry counts for both tables, how many apk inodes are held and how many of an apply failed, whether
+the setuid hook was taken and from which implementation, the geometry this module was built for, and
+the last failure. `sync-tool` reads it and writes the one-line summary into the module description,
+which is where KernelSU and Magisk show a module's state, and compares the module's geometry against
+the running kernel's config (`/proc/config.gz`).
 
 ## Invariants
 
@@ -48,10 +83,17 @@ for it, an untagged caller -- is what the parameter is for.
   uid) & 127`), or the chain length would differ from a genuinely absent uid.
 - The lookup does constant work: one hash of the target with the kernel's own uid hash (read back
   from `find_user()` when a policy is applied) gives the bucket line and the starting slot; the line
-  index is that formula or its mirrored twin, whichever keeps the address independent of the
-  contents; the probe count is fixed when the policy is laid out (1, 2, 4 or 8) and each reads its
-  slot and the mask words of all eight; indices are masked, never branched on; `cmp`+`csel` picks
-  the bit and the replacement. A query touches a function of `(caller, target)` alone --
+   index is that formula or its mirrored twin, whichever keeps the address independent of the
+   contents; the probe count is fixed when the policy is laid out (1, 2 or 4), each probe
+   reads one slot -- the target's own slot of its own line, then the same slot of the lines
+   that follow, which is where the layout puts a target whose line is full -- and one word
+   of that slot's mask, the one the caller's own id selects. Which words those are follows
+   from the caller and the target and never from the answer; indices are masked, never
+   branched on; `cmp`+`csel` picks the bit and the replacement. Probing across lines is
+   what keeps the table the size of the target count rather than of the worst collision on
+   one line: 24000 targets need 8192 lines (512 KB) instead of 32768 (2 MB). The masks are
+   interned, one entry per distinct set of callers, so a policy of tens of thousands of
+   pairs keeps a few hundred of them instead of one copy per slot. A query touches a function of `(caller, target)` alone --
   `scripts/lookup_model.py` states that function.
 - Never touch the syscall's `pt_regs`: the probe sits on `find_user()`, the first place a uid is a
   plain argument register. (arm64 has no in-register syscall entry to hook: no `__do_sys_`/
@@ -65,39 +107,42 @@ for it, an untagged caller -- is what the parameter is for.
 ## Trust
 
 - The netlink family is `GENL_ADMIN_PERM`: only root can push a policy, both blobs are
-  length-checked before they are parsed, and nothing is copied back out.
+  length-checked before they are parsed, and nothing is copied back out except the status.
 - HMA's `config.json` decides who is hidden and belongs to HMA's uid; `sync-tool` reads nothing an
   app can write.
-- The tag lives in bits 40..55 of `thread_info.flags`, which nothing else uses on these kernels, and
-  is only read-modify-written with those bits masked out.
-- The ten hooked syscalls take at most three arguments, which is what the register object they
-  receive covers.
+- The tag lives in bits 40..53 of `thread_info.flags` and the pending bit in bit 55; both are only
+  read-modify-written with those bits masked out. KernelSU's own marker is the standard
+  `TIF_SYSCALL_TRACEPOINT` bit, so the two do not share a field.
+- The hooked syscalls take at most three arguments, which is what the register object they receive
+  covers.
 - Normal runs print no addresses; the two init lines that do are behind the debug key.
 - The timing a hidden uid still costs is measured, not assumed away: `src/tools/uidbench.c` samples
   the hidden, absent and unhooked cases in one round and reports paired deltas.
 
 ## Protocol
 
-Little endian, same layout as `src/tools/netlink.cpp`. The family version is 2, and the kernel
-rejects a request that does not carry it, so a helper and a module of different versions cannot read
-each other's command ids.
+Little endian, defined once in `include/kaux.h`, which the module and the tool both include. The
+family version is 3 and the kernel rejects a request that does not carry it, so a helper and a
+module of different versions cannot read each other's command ids. Version 3 has not been published
+before 0.3.0, so it is the layout as it stands.
 
 ```
-KAUX_CMD_SET_BEGIN  (1)  blob: u32 total_pairs, u32 total_words, u32 crc32
-KAUX_CMD_SET_PAGE   (2)  blob: u32 seq, u32 npairs, then npairs * (caller, target)
-KAUX_CMD_SET_COMMIT (3)  no payload: total and CRC are checked, then applied
-KAUX_CMD_PING       (4)  no payload, ACK only
-KAUX_CMD_APK        (5)  blob: u32 n, then n * (st_dev, ino_lo, ino_hi, uid)
+KAUX_CMD_PING         (1)  no payload, ACK only
+KAUX_CMD_STAGE_BEGIN  (2)  blob: struct kaux_begin {u32 kind, u32 bytes, u32 crc32}
+KAUX_CMD_STAGE_CHUNK  (3)  blob: u32 offset, u32 len, then len bytes
+KAUX_CMD_STAGE_COMMIT (4)  no payload: byte count and CRC are checked, then applied
+KAUX_CMD_STATUS       (5)  reply: KAUX_ATTR_STATUS = struct kaux_status
 ```
 
 Family `kaux`, all commands `GENL_ADMIN_PERM`; a blob over 32 KiB is rejected before it is parsed.
-A policy goes up in pages and only becomes live when the commit matches what was announced, so a
-half-uploaded policy never takes effect.
+A blob goes up in chunks and only becomes live when the commit matches what was announced, so a
+half-uploaded policy never takes effect. `struct kaux_status` carries magic, size and version, so a
+reader that is not looking at the structure it was built for says so instead of misreading it.
 
 | limit | value |
 |---|---|
-| `(caller, target)` pairs | 4096 |
-| callers | 4096 |
-| code dirs (`UF_APK_MAX`) | 1024 |
-| dentries walked per open (`UF_DIR_DEPTH`) | 4 |
-| netlink blob (`MAX_BLOB_BYTES`) | 32 KiB |
+| `(caller, target)` pairs | 8192 |
+| callers | 8192 |
+| code dirs (`UF_APK_MAX`) | 10000 |
+| netlink blob (`KAUX_STAGED_BYTES`) | 4 MiB |
+| netlink message (`MAX_BLOB_BYTES`) | 32 KiB |
