@@ -62,6 +62,68 @@ static void check_sweep(const char *tag, u32 *pairs, u32 np, u32 *callers,
 		g_fail = 1;
 }
 
+/*
+ * The identity the hot path uses is the tag, and the tag is written from the app
+ * id inside the uid: a user id is the high part of a uid, so an app of a secondary
+ * user (100000 + app) must be named like any other -- read as a whole number it is
+ * past UF_ISOLATED_START and would never be tagged at all, which is a user whose
+ * apps are hidden by nothing. A caller==0 pair hides the target from every caller,
+ * including one that has no rules of its own.
+ */
+static void check_tag_path(void)
+{
+	static u32 pairs[] = { 10123, 10456, 110123, 110456 };
+	static u32 wild[] = { 0, 10456 };
+	u32 tag, hidden;
+
+	policy_init();
+	policy_apply(pairs, 2);
+
+	fake_current.thread_info.flags = 0;
+	uidfake_tag_adopt(0, 10123);
+	tag = uidfake_tag_app();
+	hidden = policy_query(10456);
+	printf("%-22s tag=%-4u hidden=%u\n", "tag: owner", tag, hidden);
+	if (tag != 124 || !hidden)
+		g_fail = 1;
+
+	fake_current.thread_info.flags = 0;
+	uidfake_tag_adopt(0, 110123);
+	tag = uidfake_tag_app();
+	hidden = policy_query(110456);
+	printf("%-22s tag=%-4u hidden=%u\n", "tag: secondary user", tag,
+	       hidden);
+	if (tag != 124 || !hidden)
+		g_fail = 1;
+
+	/* A system uid of a secondary user (100000 + 1000) is not an app, and an
+	 * isolated uid is not one either. */
+	fake_current.thread_info.flags = 0;
+	uidfake_tag_adopt(0, 101000);
+	if (uidfake_tag_app() != 0) {
+		printf("%-22s tagged as an app\n", "tag: user system uid");
+		g_fail = 1;
+	}
+	fake_current.thread_info.flags = 0;
+	uidfake_tag_adopt(0, 90042);
+	if (uidfake_tag_app() != 0) {
+		printf("%-22s tagged as an app\n", "tag: isolated uid");
+		g_fail = 1;
+	}
+
+	policy_apply(wild, 1);
+	fake_current.thread_info.flags = 0;
+	uidfake_tag_adopt(0, 10376);
+	tag = uidfake_tag_app();
+	hidden = policy_query(10456);
+	printf("%-22s tag=%-4u hidden=%u\n", "tag: wildcard caller", tag,
+	       hidden);
+	if (tag != 377 || !hidden || policy_query(10457))
+		g_fail = 1;
+
+	fake_current.thread_info.flags = 0;
+}
+
 int main(void)
 {
 	u32 callers[7] = { 10376, 10377, 10378, 10379, 10380, 10381, 10382 };
@@ -121,6 +183,8 @@ int main(void)
 		hw++;
 	}
 	check_sweep("two users", huge, hw * 2, hugec, 0, 30000, 30000);
+
+	check_tag_path();
 
 	printf("%s\n", g_fail ? "FAIL" : "PASS");
 	return g_fail;

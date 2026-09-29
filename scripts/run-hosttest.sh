@@ -11,7 +11,7 @@ set -eu
 cd "$(dirname "$0")/.."
 
 out=build/policy_host_test
-cc -O1 -g -I src -I scripts/hosttest -I src/include -o "$out" scripts/policy_host_test.c
+cc -O1 -g -DUIDFAKE_HOST_TEST -I src -I scripts/hosttest -I src/include -o "$out" scripts/policy_host_test.c
 "$out"
 
 abx=build/abx_reader_test
@@ -58,6 +58,21 @@ clang++ -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++23 -O1 -Wal
 "$paging"
 "$rules"
 "$presets"
+
+# The inode shadow block of src/policy.c is kernel-only, so it is extracted and
+# driven here. The scenarios pin down what went wrong in it: an inode the package
+# manager let go of while it was being read, a table handed to a file it was not
+# made for, an open that chained to itself, and a record that was installed even
+# though its path could not be stored.
+python3 scripts/extract_shadow.py
+shadow=build/shadow_test
+clang -fsanitize=address,undefined -fno-omit-frame-pointer -std=c23 -O1 -g \
+  -Wall -Wextra -Wno-unused-parameter -Wno-unused-but-set-variable \
+  -Werror=invalid-pp-token -I build -o "$shadow" \
+  scripts/shadow_host_test.c
+for mode in early-put no-reuse readd kstrdup-fail remove; do
+  "$shadow" "$mode"
+done
 
 
 
