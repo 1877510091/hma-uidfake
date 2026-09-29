@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.2
+
+- A kernel where the setuid hook cannot be taken still learns who changes ids: the setters in both
+  syscall tables are watched instead, which is the mechanism KernelSU uses for the same purpose.
+  That is the state a vendor kernel with `CONFIG_TRIM_UNUSED_KSYMS=y` puts us in -- the symbol that
+  moves a 6.12 LSM static call is not exported by any KMI this is built for, and a kernel that trims
+  unused ksyms does not even have it in its image -- and the module used to say so and then hide
+  nothing at all, because a process it never names has no rules. The status line says which of the
+  two is in place (`setuid=<implementation>` or `setuid=syscall setters`), and the entry counts it
+  reports include the setters, so that line reads ten of ten rather than four of four.
+
+- The 6.12 LSM path takes the static call table's real size from kallsyms instead of trusting this
+  build's `MAX_LSM_COUNT`, and enables the slot's own static key after taking it over; both are what
+  KernelSU does as well.
+
 ## 0.3.1
 
 - A hidden uid no longer answers measurably differently from a uid that does not exist. The lookup

@@ -27,7 +27,12 @@ An isolated process gets its uid at birth and nothing else says which app it cam
    `thread_info.flags` (zero = untagged) and an isolated child also gets a pending bit above that
    field. A task that is named already is left alone: its name came from the one transition that
    gave it its identity.
-2. **The first file of its code it opens.** The pending bit says a child is waiting. The base.apk of
+2. **Where the id change is watched.** The LSM hook at the commit is the one that sees both creds
+   at once; when the kernel cannot give it to us (no exported way to move a 6.12 static call, which
+   is what a kernel that trims unused ksyms looks like), the id setters in both syscall tables are
+   hooked instead, exactly as KernelSU does, and the two ends are read around the call. The status
+   says which of the two is in place.
+3. **The first file of its code it opens.** The pending bit says a child is waiting. The base.apk of
    every app that has rules has its `->open` replaced with a copy of the inode's
    `file_operations` that differs in that one member, and the record behind the copy is the app id:
    the first open of that file names the whole thread group, with no lookup and no walk. The inode is

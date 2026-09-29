@@ -285,6 +285,9 @@ int uidfake_lsm_install(void)
  * pair KernelSU keeps in step, including the rollback when the second half
  * fails.
  */
+typedef int (*uf_kallsyms_size_t)(unsigned long addr, unsigned long *symbolsize,
+				  unsigned long *offset);
+
 static struct lsm_static_call *g_scall;
 static void **g_slot;
 static void *g_orig;
@@ -360,6 +363,7 @@ static int uf_lsm_install(void)
 	size_t size = sizeof(struct lsm_static_calls_table);
 	size_t count, i;
 	struct lsm_static_call *scalls;
+	void *size_fn;
 	void *target;
 	void *ours = (void *)uf_fix_setuid;
 
@@ -383,6 +387,19 @@ static int uf_lsm_install(void)
 		return -ENOENT;
 
 	count = size / sizeof(struct lsm_static_call);
+	/*
+	 * A vendor can change MAX_LSM_COUNT, and then the table's own size is the truth
+	 * rather than this build's count: take it from kallsyms when that can be reached
+	 * (KernelSU reads it the same way) and keep the compile-time count when it cannot.
+	 */
+	size_fn = (void *)uidfake_lookup("kallsyms_lookup_size_offset");
+	if (size_fn) {
+		unsigned long sym_size = size;
+
+		if (((uf_kallsyms_size_t)size_fn)(table, &sym_size, NULL) &&
+		    sym_size >= sizeof(struct lsm_static_call))
+			count = sym_size / sizeof(struct lsm_static_call);
+	}
 	scalls = (struct lsm_static_call *)table;
 	for (i = 0; i < count; i++) {
 		struct lsm_static_call *scall = &scalls[i];
@@ -414,6 +431,7 @@ static int uf_lsm_install(void)
 			g_orig = NULL;
 			return -EIO;
 		}
+		static_branch_enable(scall->active);
 		smp_wmb();
 		pr_info("uidfake: task_fix_setuid taken over (static call)\n");
 		if (UF_DEBUG_ON())

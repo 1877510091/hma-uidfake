@@ -111,6 +111,7 @@ struct kaux_status {
 #define KAUX_LSM_NONE 0
 #define KAUX_LSM_TAKEN 1
 #define KAUX_LSM_FAILED 2
+#define KAUX_LSM_FALLBACK 3
 
 KAUX_STATIC_ASSERT(sizeof(struct kaux_status) == 104,
 		   "kaux_status is the wire image");

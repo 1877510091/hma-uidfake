@@ -65,7 +65,7 @@ constexpr std::size_t kApkLimit = 10000;
       line += ", page size is not the module's";
   }
 
-  if (st->lsm_state == KAUX_LSM_TAKEN)
+  if (st->lsm_state == KAUX_LSM_TAKEN || st->lsm_state == KAUX_LSM_FALLBACK)
     line +=
         std::string(", setuid=") + (st->lsm_target[0] ? st->lsm_target : "?");
   else if (st->lsm_state == KAUX_LSM_FAILED)

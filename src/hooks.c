@@ -56,7 +56,7 @@ void uidfake_status_set_lsm(int state, int error, const char *target)
 {
 	g_status.lsm_state = state;
 	g_status.lsm_error = error;
-	if (state == KAUX_LSM_TAKEN)
+	if (state == KAUX_LSM_TAKEN || state == KAUX_LSM_FALLBACK)
 		g_status.flags |= KAUX_F_SETUID;
 	if (target)
 		strscpy(g_status.lsm_target, target,
@@ -136,6 +136,8 @@ struct hook_entry {
 	 * of the two its kernel has.
 	 */
 	const char *sym32;
+	/* the 64-bit sibling of a fallback entry, when native is -1 */
+	struct hook_entry *ally;
 };
 
 /*
@@ -157,15 +159,31 @@ asmlinkage long uidfake_setpriority(const struct pt_regs *regs);
 asmlinkage long uidfake_ioprio_get(const struct pt_regs *regs);
 asmlinkage long uidfake_ioprio_set(const struct pt_regs *regs);
 
+/* The fallback: only installed when the LSM hook cannot be taken (see below). */
+asmlinkage long uidfake_setuid(const struct pt_regs *regs);
+asmlinkage long uidfake_setreuid(const struct pt_regs *regs);
+asmlinkage long uidfake_setresuid(const struct pt_regs *regs);
+asmlinkage long uidfake_setgid(const struct pt_regs *regs);
+asmlinkage long uidfake_setregid(const struct pt_regs *regs);
+asmlinkage long uidfake_setresgid(const struct pt_regs *regs);
+#ifdef CONFIG_COMPAT
+asmlinkage long uidfake32_setuid(const struct pt_regs *regs);
+asmlinkage long uidfake32_setreuid(const struct pt_regs *regs);
+asmlinkage long uidfake32_setresuid(const struct pt_regs *regs);
+asmlinkage long uidfake32_setgid(const struct pt_regs *regs);
+asmlinkage long uidfake32_setregid(const struct pt_regs *regs);
+asmlinkage long uidfake32_setresgid(const struct pt_regs *regs);
+#endif
+
 static struct hook_entry g_hook[] = {
 	{ __NR_getpriority, uidfake_getpriority, NULL,
-	  "__arm64_sys_getpriority", -1, NULL },
+	  "__arm64_sys_getpriority", -1, NULL, NULL },
 	{ __NR_setpriority, uidfake_setpriority, NULL,
-	  "__arm64_sys_setpriority", -1, NULL },
+	  "__arm64_sys_setpriority", -1, NULL, NULL },
 	{ __NR_ioprio_get, uidfake_ioprio_get, NULL, "__arm64_sys_ioprio_get",
-	  -1, NULL },
+	  -1, NULL, NULL },
 	{ __NR_ioprio_set, uidfake_ioprio_set, NULL, "__arm64_sys_ioprio_set",
-	  -1, NULL },
+	  -1, NULL, NULL },
 };
 
 /*
@@ -189,14 +207,53 @@ asmlinkage long uidfake32_ioprio_set(const struct pt_regs *regs);
 
 static struct hook_entry g_chook[] = {
 	{ NR32_GETPRIORITY, uidfake32_getpriority, NULL, NULL, 0,
-	  "__arm64_compat_sys_getpriority" },
+	  "__arm64_compat_sys_getpriority", NULL },
 	{ NR32_SETPRIORITY, uidfake32_setpriority, NULL, NULL, 1,
-	  "__arm64_compat_sys_setpriority" },
+	  "__arm64_compat_sys_setpriority", NULL },
 	{ NR32_IOPRIO_GET, uidfake32_ioprio_get, NULL, NULL, 2,
-	  "__arm64_compat_sys_ioprio_get" },
+	  "__arm64_compat_sys_ioprio_get", NULL },
 	{ NR32_IOPRIO_SET, uidfake32_ioprio_set, NULL, NULL, 3,
-	  "__arm64_compat_sys_ioprio_set" },
+	  "__arm64_compat_sys_ioprio_set", NULL },
 };
+
+static struct hook_entry g_set[] = {
+	{ __NR_setuid, uidfake_setuid, NULL, "__arm64_sys_setuid", -1, NULL,
+	  NULL },
+	{ __NR_setreuid, uidfake_setreuid, NULL, "__arm64_sys_setreuid", -1,
+	  NULL, NULL },
+	{ __NR_setresuid, uidfake_setresuid, NULL, "__arm64_sys_setresuid", -1,
+	  NULL, NULL },
+	{ __NR_setgid, uidfake_setgid, NULL, "__arm64_sys_setgid", -1, NULL,
+	  NULL },
+	{ __NR_setregid, uidfake_setregid, NULL, "__arm64_sys_setregid", -1,
+	  NULL, NULL },
+	{ __NR_setresgid, uidfake_setresgid, NULL, "__arm64_sys_setresgid", -1,
+	  NULL, NULL },
+};
+
+#ifdef CONFIG_COMPAT
+#define UF_NR32_SETUID 213
+#define UF_NR32_SETGID 214
+#define UF_NR32_SETREUID 203
+#define UF_NR32_SETREGID 204
+#define UF_NR32_SETRESUID 208
+#define UF_NR32_SETRESGID 210
+
+static struct hook_entry g_cset[] = {
+	{ UF_NR32_SETUID, uidfake32_setuid, NULL, NULL, -1,
+	  "__arm64_compat_sys_setuid", &g_set[0] },
+	{ UF_NR32_SETREUID, uidfake32_setreuid, NULL, NULL, -1,
+	  "__arm64_compat_sys_setreuid", &g_set[1] },
+	{ UF_NR32_SETRESUID, uidfake32_setresuid, NULL, NULL, -1,
+	  "__arm64_compat_sys_setresuid", &g_set[2] },
+	{ UF_NR32_SETGID, uidfake32_setgid, NULL, NULL, -1,
+	  "__arm64_compat_sys_setgid", &g_set[3] },
+	{ UF_NR32_SETREGID, uidfake32_setregid, NULL, NULL, -1,
+	  "__arm64_compat_sys_setregid", &g_set[4] },
+	{ UF_NR32_SETRESGID, uidfake32_setresgid, NULL, NULL, -1,
+	  "__arm64_compat_sys_setresgid", &g_set[5] },
+};
+#endif
 
 #endif
 
@@ -294,6 +351,92 @@ asmlinkage long uidfake32_ioprio_get(const struct pt_regs *regs)
 asmlinkage long uidfake32_ioprio_set(const struct pt_regs *regs)
 {
 	return uid_hook(regs, IOPRIO_WHO_USER, g_chook[3].orig);
+}
+#endif
+
+/* the fallback: the id setters, only installed when the LSM hook cannot be taken */
+static asmlinkage long uid_change_hook(const struct pt_regs *regs,
+				       uidfake_syscall_t orig)
+{
+	const u32 before = (u32)__kuid_val(current_fsuid());
+	const bool interesting = before == 0 ||
+				 (before % 100000u) >= UF_APP_MIN;
+	long ret;
+
+	if (interesting && uidfake_tag_isset())
+		return orig(regs);
+
+	ret = orig(regs);
+	if (ret == 0 && interesting) {
+		const u32 after = (u32)__kuid_val(current_fsuid());
+
+		if ((after % 100000u) >= UF_APP_MIN) {
+			uidfake_tag_adopt(before, after);
+			uidfake_tag_note(0, 0, before, after);
+		}
+	}
+	return ret;
+}
+
+asmlinkage long uidfake_setuid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_set[0].orig);
+}
+
+asmlinkage long uidfake_setreuid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_set[1].orig);
+}
+
+asmlinkage long uidfake_setresuid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_set[2].orig);
+}
+
+asmlinkage long uidfake_setgid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_set[3].orig);
+}
+
+asmlinkage long uidfake_setregid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_set[4].orig);
+}
+
+asmlinkage long uidfake_setresgid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_set[5].orig);
+}
+
+#ifdef CONFIG_COMPAT
+asmlinkage long uidfake32_setuid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_cset[0].orig);
+}
+
+asmlinkage long uidfake32_setreuid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_cset[1].orig);
+}
+
+asmlinkage long uidfake32_setresuid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_cset[2].orig);
+}
+
+asmlinkage long uidfake32_setgid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_cset[3].orig);
+}
+
+asmlinkage long uidfake32_setregid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_cset[4].orig);
+}
+
+asmlinkage long uidfake32_setresgid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_cset[5].orig);
 }
 #endif
 
@@ -404,6 +547,9 @@ noinline void uidfake_tag_close(void)
 /* ---- table patching ---- */
 
 static uidfake_syscall_t *main_table;
+/* The LSM hook could not be taken, so the syscall setters stand in for it. */
+static bool g_lsm_failed;
+static int g_lsm_err;
 #ifdef CONFIG_COMPAT
 static uidfake_syscall_t *compat_table;
 #endif
@@ -440,6 +586,11 @@ static uidfake_syscall_t *find_slot(uidfake_syscall_t *table,
 		/* the implementation the 64-bit table had for this syscall: what some
 		 * kernels put in the 32-bit table as well */
 		want[nwant++] = (unsigned long)g_hook[e->native].orig;
+	}
+	if (e->ally && e->ally->orig) {
+		/* a fallback entry: the implementation the 64-bit table holds for the
+		 * same syscall, which some kernels put in the 32-bit table as well */
+		want[nwant++] = (unsigned long)e->ally->orig;
 	}
 	if (e->sym) {
 		want[nwant++] = uidfake_lookup(e->sym);
@@ -599,6 +750,38 @@ static int patch_tables(void)
 		uidfake_status_set_hooks(g_status.native, n);
 	}
 #endif
+
+	if (g_lsm_failed) {
+		unsigned int set_done, cset_done = 0;
+
+		set_done = patch_entries(main_table, g_set, ARRAY_SIZE(g_set),
+					 true);
+		if (set_done != ARRAY_SIZE(g_set)) {
+			unpatch_entries(main_table, g_set, set_done);
+			pr_err("uidfake: could not hook the id setters either; identity changes are NOT watched\n");
+			return -EIO;
+		}
+		pr_warn("uidfake: LSM hook unavailable (%d); id changes are watched in the syscall tables\n",
+			g_lsm_err);
+#ifdef CONFIG_COMPAT
+		if (compat_table) {
+			cset_done = patch_entries(compat_table, g_cset,
+						  ARRAY_SIZE(g_cset), false);
+			pr_info("uidfake: %u of %u 32-bit id setter(s) hooked\n",
+				cset_done, (unsigned)ARRAY_SIZE(g_cset));
+		}
+#endif
+		/* the counts a user reads are what is hooked: ten of ten here */
+		g_status.native_expected += ARRAY_SIZE(g_set);
+#ifdef CONFIG_COMPAT
+		if (compat_table)
+			g_status.compat_expected += ARRAY_SIZE(g_cset);
+#endif
+		uidfake_status_set_hooks(g_status.native + set_done,
+					 g_status.compat + cset_done);
+		uidfake_status_set_lsm(KAUX_LSM_FALLBACK, g_lsm_err,
+				       "syscall setters");
+	}
 	return 0;
 }
 
@@ -621,11 +804,14 @@ int hooks_install(void)
 	{
 		const int lsm = uidfake_lsm_install();
 
-		if (lsm)
-			pr_err("uidfake: setuid hook not taken (%d); identity changes are NOT watched\n",
-			       lsm);
-		else
+		if (lsm) {
+			pr_warn("uidfake: setuid hook not taken (%d); falling back to the syscall setters\n",
+				lsm);
+			g_lsm_err = lsm;
+			g_lsm_failed = true;
+		} else {
 			pr_info("uidfake: id changes are watched at the commit\n");
+		}
 	}
 
 	if (!patch_tables()) {
@@ -651,6 +837,12 @@ void hooks_remove(void)
 		return;
 
 	unpatch_entries(main_table, g_hook, ARRAY_SIZE(g_hook));
+	if (g_lsm_failed) {
+#ifdef CONFIG_COMPAT
+		unpatch_entries(compat_table, g_cset, ARRAY_SIZE(g_cset));
+#endif
+		unpatch_entries(main_table, g_set, ARRAY_SIZE(g_set));
+	}
 #ifdef CONFIG_COMPAT
 	unpatch_entries(compat_table, g_chook, ARRAY_SIZE(g_chook));
 	compat_table = NULL;
