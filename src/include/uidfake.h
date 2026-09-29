@@ -21,6 +21,11 @@
  */
 
 #define POLICY_WAY 8 /* target slots per 64-byte line */
+/* How many lines one target may be placed after its own. Probing across lines rather
+ * than across the slots of a single line is what keeps the table small: the line count
+ * then follows the number of targets instead of the worst collision on one line, which
+ * is what needed 32768 lines (2 MB) for 24000 targets where 4096 (256 KB) do. */
+#define POLICY_PROBE_MAX 4
 #define POLICY_CLINE_WAY 8 /* caller slots per 64-byte line */
 #define POLICY_MIN_LINES 16
 #define POLICY_MAX_LINES \
@@ -41,7 +46,11 @@
 
 struct uid_pair { /* 8 bytes: POLICY_WAY of them fill one cache line */
 	u32 target;
-	u32 repl_k;
+	u16 repl_k;
+	/* Which of the interned caller masks this slot uses. The same set of callers
+	 * hides target after target, so the mask a slot needs is shared rather than
+	 * stored per slot; zero is the empty mask. */
+	u16 mask_id;
 };
 
 void policy_apply(const u32 *pairs, u32 npairs);
@@ -69,8 +78,14 @@ u32 policy_lookup_as(uid_t caller, uid_t target);
  * identity unforgeable: setuid() can no longer pick which hiding rules apply.
  * Only the app id is stored, because the policy is keyed by app id anyway.
  */
+/*
+ * The name a task carries sits in bits 40..53: an app id is below 10000, so
+ * fourteen bits hold one plus its offset. The window bit is above that field,
+ * not inside it -- a tag with the top bit set would read back as "still
+ * waiting" and the task would be renamed on every file it opened.
+ */
 #define UF_TAG_SHIFT 40
-#define UF_TAG_MASK 0xffffUL
+#define UF_TAG_MASK 0x3fffUL
 #define UF_APP_MIN POLICY_APP_ID_MIN
 #define UF_APP_SPAN POLICY_APP_ID_SPAN
 #define UF_ISOLATED_START \
@@ -85,17 +100,44 @@ u32 policy_lookup_as(uid_t caller, uid_t target);
 #define UF_TAG_PENDING (1UL << 55)
 
 #define UF_APK_MAX \
-	1024 /* caller code dirs the kernel knows; a user may hide from hundreds */
+	10000 /* app apks whose open is replaced. Android allows 10000 app ids per \
+	      * user; real devices stay well under this. */
 
 u32 uidfake_tag_app(void); /* app id + 1, or 0 when untagged */
 int uidfake_apk_apply(const u32 *blob,
 		      u32 n); /* n * (st_dev, ino_lo, ino_hi, uid) */
-u32 uidfake_apk_lookup(dev_t s_dev, u64 ino);
-bool uidfake_dev_is_code(
-	dev_t s_dev); /* is this a filesystem an app apk lives on? */
+/*
+ * blob: u32 n, then n * (action, uid, off, len), then the paths those offsets
+ * point into. action 0 replaces the open of the base.apk at that path, 1 puts
+ * it back, so the helper can send only what changed. A replaced inode names a
+ * waiting isolated child from the app the apk belongs to.
+ */
+int uidfake_apk_apply(const u32 *blob, u32 len);
+void uidfake_apk_remove(void); /* put every inode back (module exit) */
 void uidfake_tag_adopt(u32 old_uid, u32 new_uid);
 void uidfake_tag_prime(void);
+bool uidfake_tag_isset(void);
 void uidfake_tag_note(u32 before_sid, u32 after_sid, u32 old_uid, u32 new_uid);
+
+/*
+ * The setuid hook (see lsm.c): where the kernel hands both creds over at the
+ * commit, the syscall table is not touched for the id setters at all. Returns
+ * non-zero when the syscall table has to keep them.
+ */
+int uidfake_lsm_install(void);
+void uidfake_lsm_remove(void);
+
+/*
+ * The status the tool reads over netlink (include/kaux.h). hooks.c owns it,
+ * lsm.c and the hook table fill it in as they go.
+ */
+struct kaux_status;
+void uidfake_status_get(struct kaux_status *out);
+void uidfake_status_set_hooks(unsigned int native, unsigned int compat);
+void uidfake_status_set_lsm(int state, int error, const char *target);
+void uidfake_status_set_apks(unsigned int inodes, unsigned int expected,
+			     unsigned int failed);
+void uidfake_status_note(int error);
 
 int policy_init(void);
 void policy_free(void);
@@ -112,7 +154,7 @@ unsigned long uidfake_lookup(const char *name);
  * what a scan for a call site inside it has to stay within. Zero when the symbol
  * or its follower is unknown.
  */
-unsigned long uidfake_lookup_end(const char *name);
+unsigned long uidfake_lookup_raw(const char *name);
 
 /*
  * aarch64 branch helpers, kept inline so the host test can check the encoder: a

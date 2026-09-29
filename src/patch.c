@@ -4,22 +4,25 @@
  *
  * Kernel text is mapped read-only and the helpers that would normally make it
  * writable (set_memory_rw, text_poke) are not exported to modules. Instead the
- * physical page is translated through init_mm and mapped again writable with
- * vmap(); the instruction cache is cleaned afterwards and the synchronous path
- * stops all other CPUs, because one of them can be executing the very
- * instruction being replaced.
+ * physical address is translated through init_mm and the page is mapped again
+ * writable through the kernel's own fixmap window -- the way the kernel itself
+ * pokes text -- and a nofault copy does the write, so a translation that went
+ * wrong is an error and not a fault. The caches are cleaned afterwards and the
+ * synchronous path stops all other CPUs, because one of them can be executing
+ * the very instruction being replaced.
  *
  * The technique is the one every out-of-tree patcher on arm64 ends up using;
  * this is an independent implementation.
  */
 #include <asm/cacheflush.h>
+#include <asm/fixmap.h>
 #include <asm/pgtable.h>
 #include <linux/kprobes.h>
 #include <linux/version.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/stop_machine.h>
-#include <linux/vmalloc.h>
+#include <linux/string.h>
 
 #include "uidfake.h"
 
@@ -189,14 +192,25 @@ unsigned long uidfake_lookup(const char *name)
 	}
 }
 
-unsigned long uidfake_lookup_end(const char *name)
+/*
+ * The same lookup without preferring the jump-table variant. A table that holds
+ * function addresses (an LSM hook list, for one) holds the plain symbol, so a
+ * name has to be resolvable to exactly that to be matched against it.
+ */
+unsigned long uidfake_lookup_raw(const char *name)
 {
-	struct find_ctx ctx;
+	unsigned long addr = lookup_name(name);
 
-	find_symbol(name, &ctx);
-	return ctx.next;
+	if (addr)
+		return addr;
+
+	{
+		struct find_ctx ctx;
+
+		find_symbol(name, &ctx);
+		return ctx.addr;
+	}
 }
-
 /*
  * Symbols the patcher needs at run time. init_mm is not exported,
  * kimage_voffset/kallsyms are not either, so all of them go through the same
@@ -204,12 +218,72 @@ unsigned long uidfake_lookup_end(const char *name)
  */
 static struct mm_struct *patch_mm;
 
+/* defined below; the calibration at load asks both of them about _stext */
+static phys_addr_t phys_from_virt(unsigned long addr);
+static phys_addr_t image_phys(unsigned long addr);
+
 /* [_stext, _end): the only range this module is willing to write into. */
 static unsigned long g_text_start;
 static unsigned long g_text_end;
 static unsigned long *g_kimage_voffset;
-static bool g_walk_warned;
 static unsigned long *g_memstart_addr;
+static bool g_offset_warned;
+/*
+ * Whether the page table walk agrees with kimage_voffset on this kernel. The walk
+ * uses this module's view of struct mm_struct and of the page table geometry, and
+ * a kernel of the same version can be built with a different VA size; the image
+ * offset does not care about either. So the walk is calibrated once against it
+ * and ignored from there on if it disagrees -- the offset is the answer that holds
+ * on every configuration, and it is the one the write depends on.
+ */
+static unsigned long g_vmemmap;
+static bool g_walk_usable = true;
+/*
+ * FIXADDR_TOP as this kernel has it, worked out from the kernel's own vmemmap
+ * pointer: memory.h defines it as VMEMMAP_START - SZ_32M, and vmemmap is that
+ * region's base at run time. This module's compiled FIXADDR_TOP comes from the
+ * config it was built with, so on a kernel whose VA size differs the two
+ * disagree -- and then the slot this module thinks it mapped is not the one the
+ * kernel made. The alias is proved before it is used either way, so this is how
+ * such a kernel gets used at all rather than only refused. Zero when vmemmap is
+ * not resolvable, which leaves the compiled value as the only candidate.
+ */
+static unsigned long g_fixmap_top;
+
+/*
+ * Neither __set_fixmap() nor copy_to_kernel_nofault() is exported to modules, so
+ * both are resolved by name and reached through these. The fixmap window is the
+ * kernel's own way in -- it builds the mapping, with attributes the image's own
+ * read-only mapping does not have -- and the nofault copy turns a translation
+ * that went wrong into an error instead of a fault.
+ */
+static unsigned long g_set_fixmap_addr;
+static unsigned long g_copy_nofault_addr;
+static unsigned long g_copy_from_nofault_addr;
+
+typedef void (*uf_set_fixmap_t)(enum fixed_addresses idx, phys_addr_t phys,
+				pgprot_t prot);
+typedef long (*uf_copy_nofault_t)(void *dst, const void *src, size_t size);
+typedef long (*uf_copy_from_nofault_t)(void *dst, const void *src, size_t size);
+
+static noinline void __nocfi patch_set_fixmap(enum fixed_addresses idx,
+					      phys_addr_t phys, pgprot_t prot)
+{
+	((uf_set_fixmap_t)g_set_fixmap_addr)(idx, phys, prot);
+}
+
+static noinline long __nocfi patch_copy_nofault(void *dst, const void *src,
+						size_t size)
+{
+	return ((uf_copy_nofault_t)g_copy_nofault_addr)(dst, src, size);
+}
+
+static noinline long __nocfi patch_copy_from_nofault(void *dst, const void *src,
+						     size_t size)
+{
+	return ((uf_copy_from_nofault_t)g_copy_from_nofault_addr)(dst, src,
+								  size);
+}
 
 int uidfake_patch_init(void)
 {
@@ -221,11 +295,50 @@ int uidfake_patch_init(void)
 	patch_mm = (struct mm_struct *)uidfake_lookup("init_mm");
 	g_kimage_voffset = (unsigned long *)uidfake_lookup("kimage_voffset");
 	g_memstart_addr = (unsigned long *)uidfake_lookup("memstart_addr");
+	g_set_fixmap_addr = uidfake_lookup("__set_fixmap");
+	g_copy_nofault_addr = uidfake_lookup("copy_to_kernel_nofault");
+	if (!g_copy_nofault_addr)
+		g_copy_nofault_addr =
+			uidfake_lookup("__copy_to_kernel_nofault");
+	g_copy_from_nofault_addr = uidfake_lookup("copy_from_kernel_nofault");
+	if (!g_copy_from_nofault_addr)
+		g_copy_from_nofault_addr =
+			uidfake_lookup("__copy_from_kernel_nofault");
 	if (UF_DEBUG_ON())
-		pr_info("uidfake: init_mm=%px kimage_voffset=%px memstart_addr=%px\n",
+		pr_info("uidfake: init_mm=%px kimage_voffset=%px memstart_addr=%px set_fixmap=%px nofault=%px\n",
 			patch_mm, (void *)g_kimage_voffset,
-			(void *)g_memstart_addr);
-	return patch_mm ? 0 : -ENOENT;
+			(void *)g_memstart_addr, (void *)g_set_fixmap_addr,
+			(void *)g_copy_nofault_addr);
+	if (!patch_mm || !g_set_fixmap_addr)
+		return -ENOENT;
+
+	/*
+	 * One calibration, at load: if the walk and the image offset disagree about
+	 * where the kernel's own text is, the walk is the one that is wrong on this
+	 * device -- it goes through this module's view of struct mm_struct and of the
+	 * page table geometry, and a kernel of the same version can be built with a
+	 * different VA size. It is the offset that holds on every configuration, and
+	 * the offset is what the write needs, so the walk steps aside.
+	 */
+	g_vmemmap = uidfake_lookup_raw("vmemmap");
+	if (g_vmemmap)
+		g_fixmap_top = g_vmemmap - SZ_32M;
+	if (UF_DEBUG_ON())
+		pr_info("uidfake: vmemmap=%px fixmap_top=%#lx (this build's: %#lx)\n",
+			(void *)g_vmemmap, g_fixmap_top,
+			(unsigned long)__fix_to_virt(FIX_TEXT_POKE0) +
+				((unsigned long)FIX_TEXT_POKE0 << PAGE_SHIFT));
+
+	if (g_text_start) {
+		phys_addr_t walk = phys_from_virt(g_text_start);
+		phys_addr_t offset = image_phys(g_text_start);
+
+		if (walk && offset && walk != offset) {
+			g_walk_usable = false;
+			pr_info("uidfake: page table walk disagrees with kimage_voffset (kernel geometry is not this module's); using the image offset alone\n");
+		}
+	}
+	return 0;
 }
 struct patch_req {
 	void *addr;
@@ -234,59 +347,47 @@ struct patch_req {
 };
 
 /*
- * The 4 KB page backing a kernel address, plus the offset inside it. Kernel
- * .rodata (where sys_call_table lives) is often mapped as a 2 MB block, and the
- * image as 1 GB blocks, so block mappings have to be resolved to the page
- * inside them instead of being rejected.
+ * Physical address of a kernel address, by walking init_mm the way KernelSU's
+ * patcher does. Kernel .rodata (where sys_call_table lives) is often mapped as a
+ * 2 MB block and the image as 1 GB blocks, so a block mapping is resolved to the
+ * page inside it instead of being rejected. The page offset is part of the
+ * result, which is what the fixmap copy wants.
  */
-static struct page *kernel_page(unsigned long addr, unsigned long *off)
+static phys_addr_t phys_from_virt(unsigned long addr)
 {
 	pgd_t *pgd = pgd_offset(patch_mm, addr);
 	p4d_t *p4d;
 	pud_t *pud;
 	pmd_t *pmd;
 	pte_t *pte;
-	phys_addr_t phys;
-
-	*off = offset_in_page(addr);
-
-	if (UF_DEBUG_ON()) {
-		pgd_t *probe = (pgd_t *)((unsigned long)patch_mm +
-					 offsetof(struct mm_struct, pgd));
-
-		pr_info("uidfake: walk %px: mm=%px pgd@%#zx=%px pgd[%#lx]=%#lx\n",
-			(void *)addr, (void *)patch_mm,
-			(size_t)offsetof(struct mm_struct, pgd), (void *)probe,
-			(unsigned long)addr >> 30,
-			((const unsigned long *)
-				 probe)[(unsigned long)addr >> 30]);
-	}
 
 	if (pgd_none(*pgd) || pgd_bad(*pgd))
-		return NULL;
+		return 0;
 	p4d = p4d_offset(pgd, addr);
 	if (p4d_none(*p4d) || p4d_bad(*p4d))
-		return NULL;
+		return 0;
+#if defined(p4d_leaf)
+	if (p4d_leaf(*p4d))
+		return (phys_addr_t)(p4d_val(*p4d) & ~(P4D_SIZE - 1)) +
+		       (addr & (P4D_SIZE - 1));
+#endif
 	pud = pud_offset(p4d, addr);
 	if (pud_none(*pud) || pud_bad(*pud))
-		return NULL;
-	if (pud_leaf(*pud)) {
-		phys = (phys_addr_t)(pud_val(*pud) & ~(PUD_SIZE - 1)) +
+		return 0;
+	if (pud_leaf(*pud))
+		return (phys_addr_t)(pud_val(*pud) & ~(PUD_SIZE - 1)) +
 		       (addr & (PUD_SIZE - 1));
-		return pfn_to_page(phys >> PAGE_SHIFT);
-	}
 	pmd = pmd_offset(pud, addr);
 	if (pmd_none(*pmd) || pmd_bad(*pmd))
-		return NULL;
-	if (pmd_leaf(*pmd)) {
-		phys = (phys_addr_t)(pmd_val(*pmd) & ~(PMD_SIZE - 1)) +
+		return 0;
+	if (pmd_leaf(*pmd))
+		return (phys_addr_t)(pmd_val(*pmd) & ~(PMD_SIZE - 1)) +
 		       (addr & (PMD_SIZE - 1));
-		return pfn_to_page(phys >> PAGE_SHIFT);
-	}
 	pte = pte_offset_kernel(pmd, addr);
-	if (pte_none(*pte))
-		return NULL;
-	return pte_page(*pte);
+	if (!pte || pte_none(*pte) || !pte_present(*pte))
+		return 0;
+	return (phys_addr_t)(pte_val(*pte) & PHYS_MASK & PAGE_MASK) +
+	       (addr & ~PAGE_MASK);
 }
 /*
  * Cache maintenance inlined by hand: __builtin___clear_cache() lowers to a call
@@ -361,44 +462,124 @@ static phys_addr_t image_phys(unsigned long addr)
 	return pa;
 }
 
-static struct page *page_for(unsigned long addr, unsigned long *off)
+/*
+ * The write itself: map the target's physical page into the kernel's own fixmap
+ * window and copy through that. stop_machine holds every other CPU, so the one
+ * fixmap slot cannot be claimed by anyone else while it is in use.
+ */
+static int patch_nosync(void *dst, const void *src, size_t len)
 {
-	struct page *page = kernel_page(addr, off);
-	phys_addr_t phys;
+	unsigned long p = (unsigned long)dst;
+	phys_addr_t walk = g_walk_usable ? phys_from_virt(p) : 0;
+	phys_addr_t offset = image_phys(p);
+	phys_addr_t phy;
+	enum fixed_addresses idx = FIX_TEXT_POKE0;
+	unsigned long aliases[2];
+	unsigned int naliases = 0, a;
+	bool checked;
+	void *map;
+	int ret;
 
-	if (page)
-		return page;
-	phys = image_phys(addr);
-	if (!phys)
-		return NULL;
-	if (!g_walk_warned) {
-		g_walk_warned = true;
-		pr_info("uidfake: page table walk unusable (vendor mm_struct); using kimage_voffset\n");
+	/*
+	 * Every target is inside [_stext, _end) (checked in uidfake_patch_text), and
+	 * the image is one contiguous block, so the image offset translates it
+	 * exactly -- and it is the only translation that works on a vendor kernel
+	 * whose struct mm_struct differs from the tree this module was built
+	 * against, which is where the walk gives up. The walk is the second opinion
+	 * then, and the fallback where the offset is not readable.
+	 */
+	if (offset) {
+		if (walk && walk != offset) {
+			pr_warn("uidfake: refusing to write: the walk and the image offset disagree\n");
+			if (UF_DEBUG_ON())
+				pr_info("uidfake:   %px walk=%pa image=%pa\n",
+					dst, &walk, &offset);
+			return -EFAULT;
+		}
+		phy = offset;
+		checked = true;
+	} else {
+		if (!walk) {
+			pr_warn("uidfake: no physical address for the target\n");
+			if (UF_DEBUG_ON())
+				pr_info("uidfake:   %px\n", dst);
+			return -EFAULT;
+		}
+		if (!g_offset_warned) {
+			g_offset_warned = true;
+			pr_info("uidfake: kimage_voffset unusable; using the page table walk\n");
+		}
+		phy = walk;
+		checked = false;
 	}
-	return pfn_to_page(phys >> PAGE_SHIFT);
+
+	/*
+	 * The slot shows up at FIXADDR_TOP - idx * PAGE_SIZE, and FIXADDR_TOP is not
+	 * the same in every build: this module has the one its config gave it, and
+	 * the kernel has its own. Two candidates are therefore tried -- what this
+	 * build computes, and what the kernel's vmemmap pointer implies -- and each
+	 * is proved before it is used: the bytes at the alias have to be the bytes at
+	 * the target, or nothing is written. The reads are nofault, because a wrong
+	 * address is exactly the case where a plain read would fault. With no proof
+	 * available the compiled address is used, as before.
+	 */
+	aliases[naliases++] = __fix_to_virt(idx);
+	if (g_fixmap_top)
+		aliases[naliases++] =
+			g_fixmap_top - ((unsigned long)idx << PAGE_SHIFT);
+
+	for (a = 0; a < naliases; a++) {
+		map = (void *)(aliases[a] + (phy & ~PAGE_MASK));
+		patch_set_fixmap(idx, phy, PAGE_KERNEL);
+
+		if (!g_copy_from_nofault_addr)
+			break; /* nothing to prove it with: the first alias is used */
+		{
+			u8 seen[8], want[8];
+			const size_t n = len < sizeof(seen) ? len :
+							      sizeof(seen);
+			const bool same =
+				!patch_copy_from_nofault(seen, map, n) &&
+				!patch_copy_from_nofault(want, dst, n) &&
+				!memcmp(seen, want, n);
+
+			patch_set_fixmap(idx, 0, __pgprot(0));
+			if (same) {
+				map = (void *)(aliases[a] + (phy & ~PAGE_MASK));
+				patch_set_fixmap(idx, phy, PAGE_KERNEL);
+				break;
+			}
+		}
+	}
+	if (a == naliases) {
+		pr_warn("uidfake: no fixmap alias proved out; nothing written\n");
+		if (UF_DEBUG_ON())
+			pr_info("uidfake:   %px this build's %#lx, the kernel's %#lx\n",
+				dst, aliases[0],
+				naliases > 1 ? aliases[1] : 0UL);
+		return -EFAULT;
+	}
+
+	if (g_copy_nofault_addr)
+		ret = (int)patch_copy_nofault(map, src, len);
+	else if (checked)
+		ret = (memcpy(map, src, len), 0);
+	else
+		ret = -ENOSYS;
+	patch_set_fixmap(idx, 0, __pgprot(0));
+
+	if (ret)
+		pr_warn("uidfake: the write failed: %d\n", ret);
+	if (UF_DEBUG_ON())
+		pr_info("uidfake:   %px\n", dst);
+	return ret;
 }
 
 static int patch_do(void *arg)
 {
 	struct patch_req *r = arg;
-	unsigned long off;
-	struct page *page = page_for((unsigned long)r->addr, &off);
-	void *alias;
 
-	if (!page) {
-		pr_warn("uidfake: no page for %p\n", r->addr);
-		return -EFAULT;
-	}
-	alias = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
-	if (!alias) {
-		pr_warn("uidfake: vmap of %p failed\n", r->addr);
-		return -ENOMEM;
-	}
-	memcpy(alias + off, r->src, r->len);
-	/* the line is physically tagged, so cleaning through the alias covers the
-   * target too */
-	vunmap(alias);
-	return 0;
+	return patch_nosync(r->addr, r->src, r->len);
 }
 
 int uidfake_patch_text(void *dst, const void *src, size_t len, bool sync)
@@ -413,8 +594,9 @@ int uidfake_patch_text(void *dst, const void *src, size_t len, bool sync)
 	 * back, which is too late -- the stray write has already happened. */
 	if (!g_text_start || !g_text_end || (unsigned long)dst < g_text_start ||
 	    (unsigned long)dst + len > g_text_end) {
-		pr_warn("uidfake: refusing to patch %px: outside the kernel image\n",
-			dst);
+		pr_warn("uidfake: refusing to patch: outside the kernel image\n");
+		if (UF_DEBUG_ON())
+			pr_info("uidfake:   %px\n", dst);
 		return -EPERM;
 	}
 	if (offset_in_page((unsigned long)dst) + len > PAGE_SIZE)

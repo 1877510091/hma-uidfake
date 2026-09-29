@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * netlink.c - policy injection channel from privileged userspace into the
- * kernel. Little endian, matches src/tools/netlink.cpp.
- *
- *   KAUX_CMD_SET_BEGIN   blob = u32 total_pairs, u32 total_words, u32 crc32
- *   KAUX_CMD_SET_PAGE    blob = u32 seq, u32 npairs, then npairs * (caller,
- *                        target); caller 0 means any caller
- *   KAUX_CMD_SET_COMMIT  no payload: the staged policy is checked against the
- *                        total and the CRC and applied in one step
- *   KAUX_CMD_PING        no payload, ACK only
- *   KAUX_CMD_APK         blob = u32 n, then n * (st_dev, ino_lo, ino_hi, uid)
+ * netlink.c - the channel from privileged userspace into the kernel: the policy,
+ * the caller apk table and a status reply. The wire format is include/kaux.h,
+ * which the tool includes as well, so the two ends cannot drift apart.
  */
 
 #include "uidfake.h"
@@ -22,22 +15,7 @@
 #include <linux/string.h>
 #include <net/genetlink.h>
 
-#define KAUX_FAMILY_NAME "kaux"
-#define KAUX_FAMILY_VERSION 2
-
-enum { KAUX_ATTR_UNSPEC, KAUX_ATTR_BLOB, __KAUX_ATTR_MAX };
-#define KAUX_ATTR_MAX (__KAUX_ATTR_MAX - 1)
-
-enum {
-	KAUX_CMD_UNSPEC,
-	KAUX_CMD_SET_BEGIN, /* u32 total_pairs, u32 total_words, u32 crc32 */
-	KAUX_CMD_SET_PAGE, /* u32 seq, u32 npairs, then the pairs */
-	KAUX_CMD_SET_COMMIT, /* nothing: checks what was staged, then applies it */
-	KAUX_CMD_PING,
-	KAUX_CMD_APK,
-	__KAUX_CMD_MAX
-};
-#define KAUX_CMD_MAX (__KAUX_CMD_MAX - 1)
+#include "kaux.h"
 
 #define MAX_BLOB_BYTES 32768
 
@@ -45,19 +23,34 @@ enum {
  * last page and its CRC have been seen: the live policy is replaced in one step,
  * or not at all. */
 static DEFINE_MUTEX(g_staged_lock);
+/* The apply runs on the one buffer both ends share, so a second commit cannot
+ * start until the first has finished reading it: two uploads at once (two
+ * helpers, or a retry that overlapped) used to copy into that buffer while it
+ * was being parsed. The staging lock is not the one to hold for this -- it must
+ * be dropped before the apply, or an install hangs on the next page. */
+static DEFINE_MUTEX(g_apply_lock);
 static u32 *g_staged;
-static u32 g_staged_total;
-static u32 g_staged_pairs;
+/* The blob being applied, while the staging buffer is free for the next upload. */
+static u32 *g_apply;
+static u32 g_staged_kind;
+static u32 g_staged_total; /* bytes */
+static u32 g_staged_len; /* bytes written so far */
 static u32 g_staged_crc;
+
+/* How big a staged blob may be (KAUX_KIND_* and its layout are in kaux.h). */
+/* What the two ends actually send: a policy is at most POLICY_MAX_PAIRS pairs of two
+ * u32 (512 KiB) and an apk set at most 10000 entries of 16 bytes plus their paths
+ * (~800 KiB), so 2 MiB is twice what fits and 4 MiB was four times it -- a wasted six
+ * megabytes of kernel memory on a phone, allocated on the first upload and held until
+ * the module goes away. */
+#define KAUX_STAGED_BYTES (2u * 1024u * 1024u)
 
 /* The helper gets the same value from zlib: crc32_le(~0, ..) ^ ~0 is zlib's
  * crc32(0, ..). Both are byte-wise, so the endianness of either side is not part
  * of the agreement. */
-static u32 kaux_crc32(const u32 *words, u32 nwords)
+static u32 kaux_crc32(const u8 *data, size_t bytes)
 {
-	return crc32_le(~0u, (const u8 *)words,
-			(size_t)nwords * sizeof(*words)) ^
-	       ~0u;
+	return crc32_le(~0u, data, bytes) ^ ~0u;
 }
 
 /*
@@ -65,6 +58,9 @@ static u32 kaux_crc32(const u32 *words, u32 nwords)
  * other version would read a ping as a set: the family version is checked, not
  * assumed.
  */
+/* Defined with its ops below; the status reply names it. */
+static struct genl_family kaux_family;
+
 static int kaux_version(struct genl_info *info)
 {
 	return info->genlhdr->version == KAUX_FAMILY_VERSION ? 0 :
@@ -87,24 +83,40 @@ static int kaux_blob(struct genl_info *info, const u32 **p, u32 *len)
 /* blob: u32 total_pairs, u32 total_words, u32 crc32 */
 static int kaux_set_begin(struct sk_buff *skb, struct genl_info *info)
 {
+	const struct kaux_begin *b;
 	const u32 *p;
 	u32 len;
 	int rc = 0;
 
 	mutex_lock(&g_staged_lock);
 
-	if (kaux_blob(info, &p, &len) || len < 12) {
+	/*
+	 * The staging buffer is allocated on the first upload, not at load: it is
+	 * megabytes now, and the module is loaded while /data is barely there.
+	 */
+	if (g_staged == NULL)
+		g_staged = kcalloc(KAUX_STAGED_BYTES / sizeof(*g_staged),
+				   sizeof(*g_staged), GFP_KERNEL);
+	if (g_staged == NULL) {
+		rc = -ENOMEM;
+		goto out;
+	}
+
+	if (kaux_blob(info, &p, &len) || len < sizeof(*b)) {
 		rc = -EINVAL;
 		goto out;
 	}
-	if (p[0] > POLICY_MAX_PAIRS || p[1] != 2 * p[0]) {
+	b = (const struct kaux_begin *)p;
+	if (b->kind > KAUX_KIND_MAX || b->bytes == 0 ||
+	    b->bytes > KAUX_STAGED_BYTES) {
 		rc = -EINVAL;
 		goto out;
 	}
 
-	g_staged_total = p[0];
-	g_staged_pairs = 0;
-	g_staged_crc = p[2];
+	g_staged_kind = b->kind;
+	g_staged_total = b->bytes;
+	g_staged_len = 0;
+	g_staged_crc = b->crc32;
 
 out:
 	mutex_unlock(&g_staged_lock);
@@ -115,7 +127,7 @@ out:
 static int kaux_set_page(struct sk_buff *skb, struct genl_info *info)
 {
 	const u32 *p;
-	u32 len, npairs;
+	u32 len, offset, bytes;
 	int rc = 0;
 
 	mutex_lock(&g_staged_lock);
@@ -124,20 +136,20 @@ static int kaux_set_page(struct sk_buff *skb, struct genl_info *info)
 		rc = -EINVAL;
 		goto out;
 	}
-	npairs = p[1];
-	if (len < 8 + 8 * (unsigned long long)npairs) {
+	offset = p[0];
+	bytes = p[1];
+	if (len < 8 || bytes > len - 8) {
 		rc = -EINVAL;
 		goto out;
 	}
-	if (g_staged_total == 0 || p[0] != g_staged_pairs ||
-	    npairs > g_staged_total - g_staged_pairs) {
+	if (g_staged_total == 0 || offset != g_staged_len ||
+	    bytes > g_staged_total - g_staged_len) {
 		rc = -EINVAL;
 		goto out;
 	}
 
-	memcpy(g_staged + 2 * (size_t)g_staged_pairs, p + 2,
-	       (size_t)npairs * 8);
-	g_staged_pairs += npairs;
+	memcpy((u8 *)g_staged + offset, p + 2, bytes);
+	g_staged_len += bytes;
 
 out:
 	mutex_unlock(&g_staged_lock);
@@ -146,54 +158,57 @@ out:
 
 static int kaux_set_commit(struct sk_buff *skb, struct genl_info *info)
 {
+	u32 kind = 0, bytes = 0;
 	int rc = 0;
 
 	if (kaux_version(info))
 		return -EPROTONOSUPPORT;
 
+	mutex_lock(&g_apply_lock);
 	mutex_lock(&g_staged_lock);
-	if (g_staged_total == 0 || g_staged_pairs != g_staged_total) {
+	if (g_staged_total == 0 || g_staged_len != g_staged_total) {
 		rc = -EINVAL;
 		goto out;
 	}
-	if (kaux_crc32(g_staged, 2 * g_staged_pairs) != g_staged_crc) {
-		pr_err("uidfake: policy crc mismatch, keeping previous one\n");
+	if (kaux_crc32((const u8 *)g_staged, g_staged_len) != g_staged_crc) {
+		pr_err("uidfake: staged blob crc mismatch, nothing applied\n");
 		rc = -EINVAL;
 		goto out;
 	}
-
-	pr_info("uidfake: netlink policy: %u pair(s) in pages\n",
-		g_staged_pairs);
-	policy_apply(g_staged, g_staged_pairs);
+	/*
+	 * The blob is moved out of the staging buffer and applied with the lock
+	 * dropped. Applying it resolves paths and touches inodes, and that can
+	 * sleep: an apply inside this lock blocks the next page of the next upload,
+	 * which is what turned an install into a hang.
+	 */
+	if (g_apply == NULL)
+		g_apply = kcalloc(KAUX_STAGED_BYTES / sizeof(*g_apply),
+				  sizeof(*g_apply), GFP_KERNEL);
+	if (g_apply == NULL) {
+		rc = -ENOMEM;
+		goto out;
+	}
+	kind = g_staged_kind;
+	bytes = g_staged_total;
+	memcpy(g_apply, g_staged, bytes);
 	g_staged_total = 0;
-	g_staged_pairs = 0;
+	g_staged_len = 0;
 
 out:
 	mutex_unlock(&g_staged_lock);
+	if (rc == 0) {
+		if (kind == KAUX_KIND_POLICY) {
+			pr_info("uidfake: netlink policy: %u pair(s) in pages\n",
+				bytes / 8u);
+			policy_apply(g_apply, bytes / 8u);
+		} else {
+			pr_info("uidfake: netlink apks: %u byte(s) in pages\n",
+				bytes);
+			uidfake_apk_apply(g_apply, bytes);
+		}
+	}
+	mutex_unlock(&g_apply_lock);
 	return rc;
-}
-
-/*
- * The apk inodes of the apps that have rules: u32 n, then n * (dev, ino_lo,
- * ino_hi, uid). Read in userspace, where package names live; the kernel only
- * compares the numbers.
- */
-static int kaux_apk(struct sk_buff *skb, struct genl_info *info)
-{
-	const u32 *p;
-	u32 len, n;
-
-	if (!info->attrs[KAUX_ATTR_BLOB])
-		return -EINVAL;
-	p = nla_data(info->attrs[KAUX_ATTR_BLOB]);
-	len = nla_len(info->attrs[KAUX_ATTR_BLOB]);
-	if (len < 4 || (len & 3) || len > MAX_BLOB_BYTES)
-		return -EINVAL;
-	n = p[0];
-	if ((unsigned long long)len < 4ull + 16ull * (unsigned long long)n)
-		return -EINVAL;
-	pr_info("uidfake: netlink caller code dirs: %u entr(ies)\n", n);
-	return uidfake_apk_apply(p + 1, n);
 }
 
 static int kaux_ping(struct sk_buff *skb, struct genl_info *info)
@@ -209,22 +224,46 @@ static int kaux_ping(struct sk_buff *skb, struct genl_info *info)
 }
 
 /*
- *
- * The helper builds this from /proc: an app and the isolated processes it
- * spawns share one category layout is baked in here, the map is simply what the
- * helper measured.
+ * How the module is doing, as one fixed structure (kaux.h): what it hooked, and
+ * what it failed to. This is the only command that answers with data, and the
+ * only one a user ends up seeing -- the tool puts it in the module's description
+ * line, which is where KernelSU and Magisk show a module's state.
  */
+static int kaux_status(struct sk_buff *skb, struct genl_info *info)
+{
+	struct kaux_status st;
+	struct sk_buff *out;
+	void *hdr;
+
+	if (kaux_version(info))
+		return -EPROTONOSUPPORT;
+
+	uidfake_status_get(&st);
+
+	out = genlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
+	if (!out)
+		return -ENOMEM;
+	hdr = genlmsg_put_reply(out, info, &kaux_family, 0, KAUX_CMD_STATUS);
+	if (hdr == NULL || nla_put(out, KAUX_ATTR_STATUS, sizeof(st), &st)) {
+		nlmsg_free(out);
+		return -EMSGSIZE;
+	}
+	genlmsg_end(out, hdr);
+	return genlmsg_reply(out, info);
+}
 
 static const struct genl_ops kaux_ops[] = {
 	{ .cmd = KAUX_CMD_PING, .flags = GENL_ADMIN_PERM, .doit = kaux_ping },
-	{ .cmd = KAUX_CMD_APK, .flags = GENL_ADMIN_PERM, .doit = kaux_apk },
-	{ .cmd = KAUX_CMD_SET_BEGIN,
+	{ .cmd = KAUX_CMD_STATUS,
+	  .flags = GENL_ADMIN_PERM,
+	  .doit = kaux_status },
+	{ .cmd = KAUX_CMD_STAGE_BEGIN,
 	  .flags = GENL_ADMIN_PERM,
 	  .doit = kaux_set_begin },
-	{ .cmd = KAUX_CMD_SET_PAGE,
+	{ .cmd = KAUX_CMD_STAGE_CHUNK,
 	  .flags = GENL_ADMIN_PERM,
 	  .doit = kaux_set_page },
-	{ .cmd = KAUX_CMD_SET_COMMIT,
+	{ .cmd = KAUX_CMD_STAGE_COMMIT,
 	  .flags = GENL_ADMIN_PERM,
 	  .doit = kaux_set_commit },
 };
@@ -251,10 +290,6 @@ int netlink_init(void)
 {
 	int rc;
 
-	g_staged = kcalloc(2 * (size_t)POLICY_MAX_PAIRS, sizeof(*g_staged),
-			   GFP_KERNEL);
-	if (!g_staged)
-		return -ENOMEM;
 	rc = genl_register_family(&kaux_family);
 
 	pr_info("uidfake: netlink family '%s' register rc=%d\n",
@@ -266,5 +301,7 @@ void netlink_exit(void)
 {
 	genl_unregister_family(&kaux_family);
 	kfree(g_staged);
+	kfree(g_apply);
 	g_staged = NULL;
+	g_apply = NULL;
 }
