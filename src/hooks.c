@@ -290,6 +290,110 @@ asmlinkage long uidfake32_ioprio_set(const struct pt_regs *regs)
 }
 #endif
 
+/* ---- naming an isolated child from the apk it opens ---- */
+
+static bool uidfake_tag_pending(void)
+{
+	return (READ_ONCE(task_thread_info(current)->flags) & UF_TAG_PENDING) !=
+	       0;
+}
+
+/*
+ * The identity belongs to the process, not to the thread that happened to open
+ * the apk: every thread carries its own thread_info, and a sibling thread is
+ * exactly where a later query comes from. Threads created afterwards inherit
+ * the tag from whoever created them.
+ */
+static noinline void uidfake_tag_group(u32 tag)
+{
+	struct task_struct *t;
+
+	rcu_read_lock();
+	for_each_thread(current, t) {
+		const unsigned long flags =
+			READ_ONCE(task_thread_info(t)->flags);
+		const unsigned long next =
+			(flags &
+			 ~((UF_TAG_MASK << UF_TAG_SHIFT) | UF_TAG_PENDING)) |
+			((unsigned long)tag << UF_TAG_SHIFT);
+
+		if (next != flags)
+			WRITE_ONCE(task_thread_info(t)->flags, next);
+	}
+	rcu_read_unlock();
+}
+
+static noinline void uidfake_tag_verify(u32 tag)
+{
+	if (!uidfake_tag_pending())
+		return;
+	uidfake_tag_group(tag);
+	pr_info("uidfake: iso uid %u belongs to app %u, from the apk it opened\n",
+		(u32)__kuid_val(current_fsuid()), (u32)tag - 1u + UF_APP_MIN);
+}
+
+/*
+ * The name a waiting isolated child gets from the base.apk it opens. The write
+ * is the one the syscall path used; nothing here is reachable by user code,
+ * because only a task the framework is still setting up is pending.
+ */
+void uidfake_tag_name(u32 app)
+{
+	uidfake_tag_verify(app + 1u);
+}
+
+/*
+ * The window is over and no apk named this one: it is an app without rules and
+ * it answers as one. Saying so once is enough -- this is a normal outcome, not
+ * a failure.
+ */
+/*
+ * Take the mark off, and only the mark: the tag field is not touched. A name set
+ * while this was in flight is the answer this close was racing, and taking it away
+ * would leave the process answering as one with no rules at all -- which is the exact
+ * failure this path exists to be the end of.
+ */
+static noinline void uidfake_tag_unmark(void)
+{
+	struct task_struct *t;
+
+	rcu_read_lock();
+	for_each_thread(current, t) {
+		unsigned long *p = (unsigned long *)&task_thread_info(t)->flags;
+		unsigned long old;
+
+		do {
+			old = READ_ONCE(*p);
+			if ((old & UF_TAG_PENDING) == 0)
+				break;
+		} while (cmpxchg(p, old, old & ~UF_TAG_PENDING) != old);
+	}
+	rcu_read_unlock();
+}
+
+noinline void uidfake_tag_close(void)
+{
+	static unsigned int logged;
+
+	uidfake_tag_unmark();
+	if (logged < 4 && UF_DEBUG_ON()) {
+		logged++;
+		pr_info("uidfake: iso uid %u reached its own code, no rule names it\n",
+			(u32)__kuid_val(current_fsuid()));
+	}
+}
+
+/*
+ * The app's code directory is what the helper registers, so an open of anything
+ * inside it -- the apk, a vdex, an odex, a library -- names the app as soon as
+ * the directory is reached. The walk is one or two levels (the same for every
+ * artifact) and only runs while a child is still unnamed. Nothing that may or
+ * may not exist has to be listed, and the first file of the app's own code that
+ * is opened ends the wait either way: a hit names the app, no hit means it has
+ * no rules.
+ */
+#define UF_DIR_DEPTH 4
+
 /* ---- table patching ---- */
 
 static uidfake_syscall_t *main_table;
