@@ -32,6 +32,7 @@ jobs:
         with:
           # The module version comes from git (tag + short hash), so the tags have to be here.
           fetch-depth: 0
+          submodules: recursive
       - name: Check formatting
         run: bash scripts/check-format.sh
       - name: Build
@@ -70,6 +71,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # lkmloader is built here, from external/lkmloader.
+          submodules: recursive
       - uses: actions/download-artifact@v8
         with:
           path: build/ko

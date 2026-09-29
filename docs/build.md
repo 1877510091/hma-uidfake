@@ -10,6 +10,12 @@ values in `module/module.prop` for a tree without git). `-DUG_USE_PREBUILT_KO=ON
 already in `build/ko`, which is how the CI packaging job assembles a zip from separately built KMI
 jobs.
 
+The zip also carries `sync-tool` (built from `src/tools`) and `lkmloader` (built from the
+`external/lkmloader` submodule, an upstream MIT project pinned by `.gitmodules` + gitlink).
+`lkmloader` is what the module's scripts load the ko with: it does not depend on a particular
+root solution, which is why it is bundled.
+Clone with `--recurse-submodules`, or run `git submodule update --init`.
+
 ## Tests
 
 - `scripts/run-hosttest.sh` compiles the real `src/policy.c` against the `linux/*` shims in

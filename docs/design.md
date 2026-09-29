@@ -65,7 +65,7 @@ goes through a nofault copy.
 Diagnostics sit behind a static key (jump label): with the key off the branch is a NOP.
 
 ```
-insmod hma_uidfake.ko debug=1        # for 60 seconds, then off again
+lkmloader hma_uidfake.ko debug=1     # for 60 seconds, then off again
 ```
 
 What the module is doing is also readable where a user looks: `KAUX_CMD_STATUS` answers with the

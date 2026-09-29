@@ -32,9 +32,6 @@ kmi_from_uname() {
 }
 
 KMI="$(kmi_from_uname)"
-ui_print "- kernel: $(uname -r)"
-ui_print "- KMI: ${KMI:-Unknown}"
-
 SRC=""
 [ -n "$KMI" ] && [ -f "$MODPATH/ko/${KMI}_arm64_hma_uidfake.ko" ] && SRC="$MODPATH/ko/${KMI}_arm64_hma_uidfake.ko"
 
@@ -43,15 +40,27 @@ if [ -n "$SRC" ]; then
   for f in "$MODPATH"/ko/*_arm64_hma_uidfake.ko; do
     [ -e "$f" ] && rm -f "$f"
   done
-  ui_print "- Placed ko/hma_uidfake.ko（$(basename "$SRC")）"
+  ui_print "- $(uname -r) -> $(basename "$SRC")"
 else
-  ui_print "! No matching ${KMI:-Unknown KMI} ko; candidates: $(ls "$MODPATH/ko" 2>/dev/null | tr '\n' ' ')"
-  ui_print "! Please report to the developer if you want to use this module on your device."
+  # Nothing here can load: the kernel refuses another KMI's vermagic, and the structures this
+  # module reads differ between them. Keep the closest build for anyone who wants to try it.
+  _want_ver="$(uname -r | grep -oE '^[0-9]+\.[0-9]+' | head -n1)"
+  for _f in "$MODPATH"/ko/*-"$_want_ver"_arm64_hma_uidfake.ko; do
+    [ -e "$_f" ] || continue
+    cp -f "$_f" "$MODPATH/ko/hma_uidfake.ko.try"
+    break
+  done
+  ui_print "! No ko for $(uname -r) (KMI ${KMI:-unknown}). ko/ has: $(ls "$MODPATH/ko" | tr '\n' ' ')"
+  ui_print "! A build for another KMI will not load, and forcing it in can crash or bootloop the"
+  ui_print "! device. Build your own (docs/build.md) and report the device, its KMI and uname -r."
+  ui_print "! To try the closest build anyway, unsupported and at your own risk:"
+  ui_print "!   su -c 'mv $MODPATH/ko/hma_uidfake.ko.try $MODPATH/ko/hma_uidfake.ko && reboot'"
 fi
 
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 for f in "$MODPATH"/*.sh; do chmod 0755 "$f"; done
 [ -f "$MODPATH/ko/hma_uidfake.ko" ] && chmod 0644 "$MODPATH/ko/hma_uidfake.ko"
 [ -f "$MODPATH/sync-tool" ] && chmod 0755 "$MODPATH/sync-tool"
+[ -f "$MODPATH/lkmloader" ] && chmod 0755 "$MODPATH/lkmloader"
 
 ui_print "- Done"

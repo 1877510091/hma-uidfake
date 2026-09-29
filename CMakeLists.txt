@@ -191,6 +191,15 @@ add_custom_command(OUTPUT "${UG_SYNC}"
   VERBATIM)
 add_custom_target(sync-tool DEPENDS "${UG_SYNC}")
 
+# lkmloader: external/lkmloader is a git submodule (see .gitmodules, and the gitlink this
+# commit pins it to) and a standalone CMake project. It loads the ko by
+# resolving undefined symbols from /proc/kallsyms and calling init_module, and rewrites the
+# vermagic once when the kernel names the value it wants -- the same two things ksud insmod
+# does, with no dependency on KernelSU being installed.
+set(UG_LKM_BUILD "${CMAKE_BINARY_DIR}/lkmloader-build")
+set(UG_LKM "${UG_LKM_BUILD}/lkmloader")
+file(GLOB LKM_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/external/lkmloader/*")
+
 # Packaging: module/ template + ko + sync-tool into one zip (CMake's own tar).
 set(UG_STAGE "${CMAKE_BINARY_DIR}/stage")
 file(GLOB UG_MODULE_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/module/*")
@@ -205,18 +214,30 @@ add_custom_command(OUTPUT "${UG_STAGE}/.stamp"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_BINARY_DIR}/module.prop" "${UG_STAGE}/module.prop"
   COMMAND ${CMAKE_COMMAND} -E copy_directory "${KO_DIR}" "${UG_STAGE}/ko"
   COMMAND ${CMAKE_COMMAND} -E copy "${UG_SYNC}" "${UG_STAGE}/sync-tool"
+  COMMAND ${CMAKE_COMMAND} -E copy "${UG_LKM}" "${UG_STAGE}/lkmloader"
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/external/lkmloader/LICENSE" "${UG_STAGE}/lkmloader.LICENSE"
   COMMAND ${CMAKE_COMMAND} -E touch "${UG_STAGE}/.stamp"
-  DEPENDS ${_ko_outputs} sync-tool ${UG_MODULE_FILES}
+  DEPENDS ${_ko_outputs} sync-tool lkmloader ${UG_MODULE_FILES}
   COMMENT "staging module contents"
   VERBATIM)
 
 add_custom_command(OUTPUT "${UG_ZIP}"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dist"
   COMMAND ${CMAKE_COMMAND} -E rm -f "${UG_ZIP}"
-  COMMAND ${CMAKE_COMMAND} -E tar cf "${UG_ZIP}" --format=zip -- ${UG_MODULE_ITEMS} sync-tool ko
+  COMMAND ${CMAKE_COMMAND} -E tar cf "${UG_ZIP}" --format=zip -- ${UG_MODULE_ITEMS} sync-tool lkmloader lkmloader.LICENSE ko
   WORKING_DIRECTORY "${UG_STAGE}"
   DEPENDS "${UG_STAGE}/.stamp"
   COMMENT "packing ${UG_ZIP}"
   VERBATIM)
+
+add_custom_command(OUTPUT "${UG_LKM}"
+  COMMAND ${CMAKE_COMMAND} -S "${CMAKE_CURRENT_SOURCE_DIR}/external/lkmloader" -B "${UG_LKM_BUILD}"
+          -DCMAKE_TOOLCHAIN_FILE=${UG_NDK}/build/cmake/android.toolchain.cmake
+          -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=24 -DCMAKE_BUILD_TYPE=Release
+  COMMAND ${CMAKE_COMMAND} --build "${UG_LKM_BUILD}"
+  DEPENDS ${LKM_SOURCES}
+  COMMENT "building lkmloader (CMake + NDK)"
+  VERBATIM)
+add_custom_target(lkmloader DEPENDS "${UG_LKM}")
 
 add_custom_target(module ALL DEPENDS "${UG_ZIP}")
