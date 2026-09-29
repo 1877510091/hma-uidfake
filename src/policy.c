@@ -904,7 +904,195 @@ static u32 policy_index_mode(u32 target, u32 mirror, u32 shift)
  * SID the task had before the syscall, after_sid the one it has now.
  */
 
+/*
+ * Prime the SID map from the tasks that already exist. A module loaded onto a
+ * running system has never seen their transitions, and an app process without a
+ * tag has no hiding rules at all - that is why a manual rmmod/insmod made the
+ * hiding disappear until every app was restarted. The walk reads each task's
+ * own cred: the same trust the uid based design always had for processes that
+ * predate us, while everything created afterwards goes through the hooks.
+ */
 
+/*
+ * Give the processes that already exist their identity. A module loaded onto a
+ * running system has never seen their transitions, and an untagged app process
+ * would have no hiding rules at all - which is exactly what a manual
+ * rmmod/insmod looked like. The walk reads each task's own cred, the same trust
+ * the uid based design always had, and it only writes the tag: no allocation,
+ * no lock and nothing that can sleep, so it is safe to run here.
+ */
+/*
+ * The identity tag and the window bit live in the high bits of thread_info.flags,
+ * in the same word as the TIF_* bits the rest of the kernel updates with
+ * set_bit()/clear_bit(). A read-modify-write of our own would lose a TIF_* bit set
+ * in between -- TIF_NEED_RESCHED, TIF_NOTIFY_RESUME -- so the word is moved with a
+ * compare-and-swap: only the tag bits (and the window bit) are touched, and every
+ * other bit is carried over exactly as it was read.
+ */
+static void uf_ti_flags_rmw(struct task_struct *t, unsigned long clear,
+			    unsigned long set)
+{
+	unsigned long *p = (unsigned long *)&task_thread_info(t)->flags;
+	unsigned long old, new;
+
+	do {
+		old = READ_ONCE(*p);
+		new = (old & ~clear) | set;
+		if (new == old)
+			return;
+	} while (cmpxchg(p, old, new) != old);
+}
+
+#define UF_TAG_CLEAR ((UF_TAG_MASK << UF_TAG_SHIFT) | UF_TAG_PENDING)
+#define UF_TAG_SET(v) (((unsigned long)(v)) << UF_TAG_SHIFT)
+
+/*
+ * Mark a task as waiting to be named, and only that: the tag field is left exactly
+ * as it is. A task that is named in the meantime keeps its name -- the naming runs
+ * on another thread of the same group, and the name is what every hiding rule of
+ * that task hangs on, so taking a fresh one away is the one thing this must not do.
+ * Read, test and compare-and-swap, in that order, for the same reason.
+ */
+static bool uf_ti_mark_pending(struct task_struct *t)
+{
+	unsigned long *p = (unsigned long *)&task_thread_info(t)->flags;
+	unsigned long old;
+
+	do {
+		old = READ_ONCE(*p);
+		if (old & (UF_TAG_MASK << UF_TAG_SHIFT))
+			return false;
+	} while (cmpxchg(p, old, old | UF_TAG_PENDING) != old);
+	return true;
+}
+
+/* The tag of any task, current or not; only the field, never the window bit. */
+static u32 uf_ti_tag(struct task_struct *t)
+{
+	return (u32)((READ_ONCE(task_thread_info(t)->flags) >> UF_TAG_SHIFT) &
+		     UF_TAG_MASK);
+}
+
+void uidfake_tag_prime(void)
+{
+	struct task_struct *task, *thread;
+	u32 primed = 0;
+
+	rcu_read_lock();
+	for_each_process(task) {
+		for_each_thread(task, thread) {
+			const struct cred *cred = get_task_cred(thread);
+			u32 id;
+
+			if (!cred)
+				continue;
+			id = (u32)__kuid_val(cred->fsuid) % 100000u;
+			if (id >= UF_APP_MIN && id < UF_ISOLATED_START) {
+				if (uf_ti_tag(thread) == 0) {
+					uf_ti_flags_rmw(thread, UF_TAG_CLEAR,
+							UF_TAG_SET(id -
+								   UF_APP_MIN +
+								   1u));
+					primed++;
+				}
+			}
+			put_cred(cred);
+		}
+	}
+	rcu_read_unlock();
+	pr_info("uidfake: %u task(s) primed from the running system\n", primed);
+}
+
+/*
+ * isolated uid -> app id. The SID of an app_zygote child is switched to
+ * isolated_app inside the child, after our hook has run, so the SID map can
+ * never learn it. What the hook does see is the transition itself: the child
+ * leaves with an isolated uid while the SID it carries at that moment is still
+ * the app's. Recording the uid under that app closes the loop, and the lookup
+ * reads the same uid back with current_fsuid().
+ */
+
+/*
+ * A task carries its name already. Nothing that follows should touch it: the name
+ * was set once, from the one transition that gave the task its identity, and a
+ * process that changes ids again -- setresuid(uid, uid, uid) is the usual one --
+ * must not be re-tagged or reported again.
+ */
+bool uidfake_tag_isset(void)
+{
+	const unsigned long flags = READ_ONCE(task_thread_info(current)->flags);
+
+	return ((flags >> UF_TAG_SHIFT) & UF_TAG_MASK) != 0;
+}
+
+void uidfake_tag_note(u32 before_sid, u32 after_sid, u32 old_uid, u32 new_uid)
+{
+	(void)before_sid;
+	(void)after_sid;
+
+	if ((new_uid % 100000u) >= UF_ISOLATED_START) {
+		/*
+     * An isolated child. Nothing in its own state names the app it belongs to:
+     * the context is shared, the supplementary groups are the pool's and its
+     * parent is the zygote. It is marked here so the first file it opens can
+     * name it; until one does it answers as a process with no rules of its own.
+     */
+		/* The mark, and nothing else: a name that arrives while this is in
+		 * flight is the answer this was racing, and it is never taken away. */
+		if (uf_ti_mark_pending(current))
+			pr_info("uidfake: iso birth uid %u marked, awaiting the apk it opens\n",
+				new_uid);
+		return;
+	}
+
+	if ((old_uid % 100000u) < UF_APP_MIN &&
+	    (new_uid % 100000u) >= UF_APP_MIN &&
+	    (new_uid % 100000u) < UF_ISOLATED_START) {
+		const u32 app = (new_uid % 100000u) - UF_APP_MIN;
+
+		if (app < UF_APP_SPAN)
+			pr_info("uidfake: app birth uid %u -> app %u\n",
+				new_uid, app);
+	}
+}
+
+/*
+ * The app id an untagged process belongs to, through its own SID. Cached in the
+ * tag, so the translation happens once per process.
+ */
+
+u32 uidfake_tag_app(void)
+{
+	return (u32)((task_thread_info(current)->flags >> UF_TAG_SHIFT) &
+		     UF_TAG_MASK);
+}
+
+void uidfake_tag_adopt(u32 old_uid, u32 new_uid)
+{
+	u32 app;
+
+	/* One shot, one transition: init/zygote giving an app uid to a fresh process.
+   */
+	if (uf_ti_tag(current) != 0)
+		return;
+	/*
+	 * Every comparison is on the app id inside the uid, never on the whole uid: a
+	 * user id is the high part of it, so a secondary user's app (100000 + app) is
+	 * past UF_ISOLATED_START as a number -- read raw, every app of that user would
+	 * look like an isolated child and never be named at all, and a system uid of
+	 * that user (100000 + 1000) would be tagged as an app.
+	 */
+	if ((old_uid % 100000u) >= UF_APP_MIN)
+		return;
+	if ((new_uid % 100000u) < UF_APP_MIN ||
+	    (new_uid % 100000u) >= UF_ISOLATED_START)
+		return;
+
+	app = (new_uid % 100000u) - UF_APP_MIN;
+	if (app >= UF_APP_SPAN)
+		return;
+	uf_ti_flags_rmw(current, UF_TAG_CLEAR, UF_TAG_SET(app + 1u));
+}
 
 /*
  * Same lines and same loads for a given (caller, target), whatever the answer: the

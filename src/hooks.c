@@ -496,7 +496,27 @@ int hooks_install(void)
 	if (uidfake_patch_init())
 		return 0;
 
-	
+	/*
+	 * Where the kernel hands both creds over at the commit, that hook is what the
+	 * id setters used to be. Taken before the tables are patched, so a hook that
+	 * cannot be taken is known before anything else is installed.
+	 */
+	/*
+	 * The change of identity is watched where the kernel commits it, and there is
+	 * no second mechanism behind this one: a kernel where the hook cannot be taken
+	 * gets a module that hides callers but never learns about new ones, and says
+	 * so loudly, instead of quietly hooking the syscalls the id setters use.
+	 */
+	{
+		const int lsm = uidfake_lsm_install();
+
+		if (lsm)
+			pr_err("uidfake: setuid hook not taken (%d); identity changes are NOT watched\n",
+			       lsm);
+		else
+			pr_info("uidfake: id changes are watched at the commit\n");
+	}
+
 	if (!patch_tables()) {
 		/*
      * The vendor hook covers every open path, not just openat, and keeps
@@ -526,4 +546,6 @@ void hooks_remove(void)
 #endif
 	main_table = NULL;
 
+	/* the identity changes stay covered until the last moment */
+	uidfake_lsm_remove();
 }
