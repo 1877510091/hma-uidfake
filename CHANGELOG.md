@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1
+
+- A hidden uid no longer answers measurably differently from a uid that does not exist. The lookup
+  picked the replacement with a branch on the answer -- a predictor can learn that and a clock can
+  see it -- and the value it picked was one the kernel takes several nanoseconds longer to reject
+  than an ordinary uid. Both are fixed, and `uidbench` now judges its verdict against a control
+  class (the same hidden uid measured twice) instead of the spread between two absent uids, which
+  had been calling a real 13 ns difference not exploitable.
+
 ## 0.3.0
 
 - An isolated child is named from the apk it opens, instead of from the openat hook that used to walk

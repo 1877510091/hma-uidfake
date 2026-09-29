@@ -32,7 +32,20 @@
 	32768 /* 8 slots a line, so this covers ~260k targets */
 #define POLICY_MAX_CALLERS 4096
 #define POLICY_REPL_BITS 12
-#define POLICY_REPL_BASE 0x40000000u
+/*
+ * The first uid a hidden target may be replaced with. Two properties matter, and the
+ * second is about what a caller can measure: the value has to hash into the same
+ * uidhash bucket as the target, so the syscalls that go through find_user() walk the
+ * chain they would for the target itself, and it has to be a value the kernel rejects
+ * as cheaply as any ordinary uid that does not exist. The window is low for the second
+ * one: on a device, getpriority(PRIO_USER, x) costs about 10 ns more to answer for
+ * x = 0x40000000 than for x = 10500, and that difference is exactly the timing signal
+ * between "hidden" and "no such uid" that uidbench measures. 20001..24096 (the window
+ * is POLICY_REPL_MAX wide) is not inside any uid range Android hands out -- apps are
+ * 10000..19999 per user, isolated children 90000..98999 -- and make_replace() still
+ * refuses any candidate find_user() says exists.
+ */
+#define POLICY_REPL_BASE 20001u
 #define POLICY_REPL_MAX (1u << POLICY_REPL_BITS)
 #define POLICY_ID_NONE 0xffffffffu
 #define POLICY_APP_ID_MIN 10000u /* app uids: 10000 + appid + user * 100000 */

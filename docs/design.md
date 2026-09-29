@@ -83,17 +83,25 @@ the running kernel's config (`/proc/config.gz`).
   uid) & 127`), or the chain length would differ from a genuinely absent uid.
 - The lookup does constant work: one hash of the target with the kernel's own uid hash (read back
   from `find_user()` when a policy is applied) gives the bucket line and the starting slot; the line
-   index is that formula or its mirrored twin, whichever keeps the address independent of the
    contents; the probe count is fixed when the policy is laid out (1, 2 or 4), each probe
    reads one slot -- the target's own slot of its own line, then the same slot of the lines
    that follow, which is where the layout puts a target whose line is full -- and one word
    of that slot's mask, the one the caller's own id selects. Which words those are follows
    from the caller and the target and never from the answer; indices are masked, never
-   branched on; `cmp`+`csel` picks the bit and the replacement. Probing across lines is
-   what keeps the table the size of the target count rather than of the worst collision on
-   one line: 24000 targets need 8192 lines (512 KB) instead of 32768 (2 MB). The masks are
-   interned, one entry per distinct set of callers, so a policy of tens of thousands of
-   pairs keeps a few hundred of them instead of one copy per slot. A query touches a function of `(caller, target)` alone --
+   branched on; `cmp`+`csel` picks the bit and the replacement, and the select is a `csel`
+   rather than a branch on purpose (a predictor can learn a branch on the answer). Probing
+   across lines is what keeps the table the size of the target count rather than of the
+   worst collision on one line: 24000 targets need 8192 lines (512 KB) instead of 32768
+   (2 MB). The masks are interned, one entry per distinct set of callers, so a policy of
+   tens of thousands of pairs keeps a few hundred of them instead of one copy per slot.
+
+   The replacement a hidden target answers with is chosen once, at apply time, from a low
+   unassigned range (20001..24096) carrying the target's own uidhash bucket, so a syscall
+   that resolves a uid through `find_user()` walks the chain it would for the target. It is
+   low because the kernel rejects a small uid several nanoseconds faster than a large one,
+   which any caller can measure (`uidbench`, which is why the select is a `csel` too). What
+   is left after both is the kernel's own per-value cost variation, the same for these
+   values as for any other uid that does not exist. A query touches a function of `(caller, target)` alone --
   `scripts/lookup_model.py` states that function.
 - Never touch the syscall's `pt_regs`: the probe sits on `find_user()`, the first place a uid is a
   plain argument register. (arm64 has no in-register syscall entry to hook: no `__do_sys_`/

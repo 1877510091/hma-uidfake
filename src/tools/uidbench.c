@@ -18,7 +18,13 @@
  * overhead and its granularity are amortised by K.
  *
  * Reported per class: n, mean ns/call, sd. Then:
- *   - paired (same round) deltas H1-AB, H1-H2, H1-C1 with mean, sd, paired t;
+ *   - paired (same round) deltas H1-AB, H1-H2, H1-C1 and H1-HC with mean, sd,
+ * paired t. HC is the *same uid as H1* measured as its own class, so H1-HC is
+ * the noise floor of this harness with the uid held constant: the verdict
+ * compares the signal H1-AB against it, because the comparison an app can
+ * actually make is "this candidate uid" against "a uid I know does not exist",
+ * never "two hidden uids". Using the AB-AB2 uid spread as the yardstick hid a
+ * real 13 ns difference (see the commit that added HC);
  *   - Welch t for H1 vs AB (the primary test), H1 vs H2 (the noise floor), H1
  * vs C1;
  *   - the number of paired samples an attacker needs for one 5 sigma decision,
@@ -62,11 +68,11 @@
 #define PRIO_USER_NR 2
 #define IOPRIO_WHO_PROCESS 1
 
-enum { CL_H1, CL_H2, CL_AB, CL_AB2, CL_C1, CL_C2, CL_N };
+enum { CL_H1, CL_H2, CL_HC, CL_AB, CL_AB2, CL_C1, CL_C2, CL_N };
 
-static const char *cl_name[] = {"H1 hidden1",      "H2 hidden2",
-                                "AB absent ",      "AB2 absent2",
-                                "C1 getprio(pid)", "C2 ioprio(pid)"};
+static const char *cl_name[] = {
+    "H1 hidden1",  "H2 hidden2",      "HC hidden1 again", "AB absent ",
+    "AB2 absent2", "C1 getprio(pid)", "C2 ioprio(pid)"};
 
 static unsigned long cl_arg[CL_N];
 static volatile long cl_sink;
@@ -87,6 +93,7 @@ static __attribute__((noinline)) void run_block(int cls, long k) {
     switch (cls) {
     case CL_H1:
     case CL_H2:
+    case CL_HC:
     case CL_AB:
       acc += syscall(SYS_getpriority, PRIO_USER_NR, (int)cl_arg[cls]);
       break;
@@ -158,7 +165,7 @@ static double probe_ns(int which, unsigned long arg, long k) {
 /* Give back the series when a run stops before the report is printed; the
  * pointers stay owned by the caller, so nothing is freed twice. */
 static void free_series(double **v, double *d_ab, double *d_h2, double *d_c1,
-                        double *d_ab2) {
+                        double *d_ab2, double *d_hc) {
   int i;
 
   for (i = 0; i < CL_N; i++) {
@@ -169,6 +176,7 @@ static void free_series(double **v, double *d_ab, double *d_h2, double *d_c1,
   free(d_h2);
   free(d_c1);
   free(d_ab2);
+  free(d_hc);
 }
 
 static void usage(const char *argv0) {
@@ -184,6 +192,7 @@ static void usage(const char *argv0) {
 int uidbench_main(int argc, char **argv) {
   double *v[CL_N] = {0};
   double *d_ab = NULL, *d_h2 = NULL, *d_c1 = NULL, *d_ab2 = NULL;
+  double *d_hc = NULL;
   unsigned long hidden1 = 0, hidden2 = 0, absent = 19999, dead = 0x7fffff00ul;
   long rounds = 20000, block = 256;
   int pin = -1, progress = -1, force = 0, i, n_absent = 0;
@@ -256,6 +265,9 @@ int uidbench_main(int argc, char **argv) {
   }
 
   cl_arg[CL_H1] = hidden1;
+  /* the same uid as H1, measured as its own class: the control for the verdict
+   */
+  cl_arg[CL_HC] = hidden1;
   cl_arg[CL_H2] = hidden2;
   cl_arg[CL_C1] = dead;
   cl_arg[CL_C2] = dead;
@@ -264,7 +276,7 @@ int uidbench_main(int argc, char **argv) {
     v[i] = calloc((size_t)rounds, sizeof(double));
     if (!v[i]) {
       fprintf(stderr, "uidbench: out of memory\n");
-      free_series(v, d_ab, d_h2, d_c1, d_ab2);
+      free_series(v, d_ab, d_h2, d_c1, d_ab2, d_hc);
       return 1;
     }
   }
@@ -272,6 +284,12 @@ int uidbench_main(int argc, char **argv) {
   d_h2 = calloc((size_t)rounds, sizeof(double));
   d_c1 = calloc((size_t)rounds, sizeof(double));
   d_ab2 = calloc((size_t)rounds, sizeof(double));
+  d_hc = calloc((size_t)rounds, sizeof(double));
+  if (!d_ab2 || !d_hc) {
+    fprintf(stderr, "uidbench: out of memory\n");
+    free_series(v, d_ab, d_h2, d_c1, d_ab2, d_hc);
+    return 1;
+  }
 
   /* sanity probe: a hidden uid that exists and is not hooked takes the 'uid
    * exists' path, which walks every process (measured 674 us against 0.45 us)
@@ -286,7 +304,7 @@ int uidbench_main(int argc, char **argv) {
               "load the "
               "policy. (--force overrides)\n",
               hidden1, (int)getuid());
-      free_series(v, d_ab, d_h2, d_c1, d_ab2);
+      free_series(v, d_ab, d_h2, d_c1, d_ab2, d_hc);
       return 3;
     }
     for (i = 0; i < n_absent; i++) {
@@ -296,7 +314,7 @@ int uidbench_main(int argc, char **argv) {
                 "pick one that is neither installed nor hidden\n",
                 absent_list[i]);
         if (!force) {
-          free_series(v, d_ab, d_h2, d_c1, d_ab2);
+          free_series(v, d_ab, d_h2, d_c1, d_ab2, d_hc);
           return 3;
         }
       }
@@ -327,6 +345,7 @@ int uidbench_main(int argc, char **argv) {
     d_h2[r] = v[CL_H1][r] - v[CL_H2][r];
     d_c1[r] = v[CL_H1][r] - v[CL_C1][r];
     d_ab2[r] = v[CL_AB][r] - v[CL_AB2][r];
+    d_hc[r] = v[CL_H1][r] - v[CL_HC][r];
     if (progress && r >= next) {
       double el = ((double)now_ns() - t0) / 1e9;
       double frac = (double)(r + 1) / (double)rounds;
@@ -342,17 +361,19 @@ int uidbench_main(int argc, char **argv) {
     fprintf(stderr, "\r  100.0%%  %ld/%ld rounds done\n", rounds, rounds);
 
   {
-    struct stat_t h1, h2, ab, c1, dab, dab2, dh2, dc1;
+    struct stat_t h1, h2, hc, ab, c1, dab, dab2, dh2, dc1, dhc;
     size_t n, warm = (size_t)((double)rounds * warmfrac);
     double tab2, th2, ratio;
 
     n = (size_t)rounds - warm;
     h1 = trimmed(v[CL_H1] + warm, n, trim);
     h2 = trimmed(v[CL_H2] + warm, n, trim);
+    hc = trimmed(v[CL_HC] + warm, n, trim);
     ab = trimmed(v[CL_AB] + warm, n, trim);
     c1 = trimmed(v[CL_C1] + warm, n, trim);
     dab = trimmed(d_ab + warm, n, trim);
     dab2 = trimmed(d_ab2 + warm, n, trim);
+    dhc = trimmed(d_hc + warm, n, trim);
     dh2 = trimmed(d_h2 + warm, n, trim);
     dc1 = trimmed(d_c1 + warm, n, trim);
     tab2 = dab2.sd > 0 ? dab2.mean / (dab2.sd / sqrt((double)dab2.n)) : 0.0;
@@ -369,6 +390,7 @@ int uidbench_main(int argc, char **argv) {
     printf("\n  class              n        mean ns   sd ns\n");
     printf("  %-18s %-8zu %8.2f %8.2f\n", cl_name[CL_H1], h1.n, h1.mean, h1.sd);
     printf("  %-18s %-8zu %8.2f %8.2f\n", cl_name[CL_H2], h2.n, h2.mean, h2.sd);
+    printf("  %-18s %-8zu %8.2f %8.2f\n", cl_name[CL_HC], hc.n, hc.mean, hc.sd);
     printf("  %-18s %-8zu %8.2f %8.2f\n", cl_name[CL_AB], ab.n, ab.mean, ab.sd);
     printf("\n  paired deltas (same round, trimmed)\n");
     printf("    H1 - AB  : %+7.3f ns  sd %6.2f  t %8.2f   <- signal (hidden vs "
@@ -376,6 +398,15 @@ int uidbench_main(int argc, char **argv) {
            dab.mean, dab.sd,
            tab2 * 0 +
                (dab.sd > 0 ? dab.mean / (dab.sd / sqrt((double)dab.n)) : 0.0));
+    printf("    H1 - HC  : %+7.3f ns  sd %6.2f  t %8.2f   <- control: the same "
+           "uid, "
+           "so this is the noise floor\n",
+           dhc.mean, dhc.sd,
+           dhc.sd > 0 ? dhc.mean / (dhc.sd / sqrt((double)dhc.n)) : 0.0);
+    printf(
+        "    HC - AB  : %+7.3f ns  (means)              <- the part a caller "
+        "can attribute to hiding\n",
+        hc.mean - ab.mean);
     printf("    AB - AB2 : %+7.3f ns  sd %6.2f  t %8.2f   <- reference: plain "
            "uid spread\n",
            dab2.mean, dab2.sd, tab2);
@@ -403,16 +434,20 @@ int uidbench_main(int argc, char **argv) {
            dab.mean, dab.mean - 1.96 * dab.sd / sqrt((double)dab.n),
            dab.mean + 1.96 * dab.sd / sqrt((double)dab.n),
            dab.sd / sqrt((double)dab.n));
-    printf("    reference AB-AB2: %+.3f ns  sd %.3f ns  (3 sigma = %.3f ns)\n",
-           dab2.mean, dab2.sd, 3.0 * dab2.sd);
-    printf("    hidden vs absent   : %s  (|signal| %.3f vs tolerances "
-           "3sd=%.3f, %.3f ns)\n",
-           (fabs(dab.mean) <= 3.0 * dab2.sd || fabs(dab.mean) <= max_ns)
+    printf("    control H1-HC   : %+.3f ns  sd %.3f ns  (3 sigma = %.3f ns, "
+           "the same uid\n"
+           "                      measured twice; the AB-AB2 uid spread above "
+           "is %.3f ns)\n",
+           dhc.mean, dhc.sd, 3.0 * dhc.sd, 3.0 * dab2.sd);
+    printf("    hidden vs absent   : %s  (|signal| %.3f vs tolerance "
+           "3sd(control)=%.3f, "
+           "%.3f ns)\n",
+           (fabs(dab.mean) <= 3.0 * dhc.sd || fabs(dab.mean) <= max_ns)
                ? "PASS"
                : "FAIL",
-           dab.mean, 3.0 * dab2.sd, max_ns);
+           dab.mean, 3.0 * dhc.sd, max_ns);
     printf("    exploitable        : %s\n",
-           (fabs(dab.mean) <= 3.0 * dab2.sd || fabs(dab.mean) <= max_ns)
+           (fabs(dab.mean) <= 3.0 * dhc.sd || fabs(dab.mean) <= max_ns)
                ? "no"
                : "YES");
     printf("    similar-size ratio : %s  (%.3f vs band %.2f) [loose]\n",
@@ -423,20 +458,20 @@ int uidbench_main(int argc, char **argv) {
       FILE *f = fopen(csv, "w");
 
       if (f) {
-        fprintf(f, "round,H1,H2,AB,C1,dH1_AB,dH1_H2,dH1_C1,dAB_AB2\n");
+        fprintf(f,
+                "round,H1,H2,HC,AB,C1,dH1_AB,dH1_H2,dH1_C1,dAB_AB2,dH1_HC\n");
         for (r = 0; r < rounds; r++)
-          fprintf(f, "%ld,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", r,
-                  v[CL_H1][r], v[CL_H2][r], v[CL_AB][r], v[CL_C1][r], d_ab[r],
-                  d_h2[r], d_c1[r], d_ab2[r]);
+          fprintf(f, "%ld,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                  r, v[CL_H1][r], v[CL_H2][r], v[CL_HC][r], v[CL_AB][r],
+                  v[CL_C1][r], d_ab[r], d_h2[r], d_c1[r], d_ab2[r], d_hc[r]);
         fclose(f);
         printf("\n  raw samples written to %s\n", csv);
       }
     }
     fflush(stdout);
 
-    free_series(v, d_ab, d_h2, d_c1, d_ab2);
-    return (fabs(dab.mean) <= 3.0 * dab2.sd || fabs(dab.mean) <= max_ns) ? 0
-                                                                         : 1;
+    free_series(v, d_ab, d_h2, d_c1, d_ab2, d_hc);
+    return (fabs(dab.mean) <= 3.0 * dhc.sd || fabs(dab.mean) <= max_ns) ? 0 : 1;
   }
 }
 

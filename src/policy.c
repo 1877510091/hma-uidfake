@@ -1131,6 +1131,30 @@ static u32 mask_bit(const u64 *m, u32 cid)
 	return (u32)((m[w] >> (cid & 63)) & 1);
 }
 
+/*
+ * A select the compiler cannot undo. "?:" and the mask that means the same thing both get
+ * turned back into a branch when the compiler thinks that is cheaper -- it did, twice, on
+ * the replacement value: cbz on (hit|wild), then cbz on repl. A branch on the answer is
+ * exactly what must not exist here: a predictor can learn it and a clock can see it, and
+ * that is the whole difference this module is trying not to have. cmp + csel, two
+ * instructions, the same two whatever the answer is.
+ */
+static __always_inline u64 uf_select(u64 when_true, u64 when_false, u32 nonzero)
+{
+#if defined(__aarch64__)
+	u64 out;
+
+	asm("cmp\t%w3, #0\n\tcsel\t%0, %1, %2, ne"
+	    : "=r"(out)
+	    : "r"(when_true), "r"(when_false), "r"(nonzero));
+	return out;
+#else
+	/* The host test and the userspace model compile this file too. A real branch is fine
+	 * there: nothing is timed, and x86 is not the target. */
+	return nonzero ? when_true : when_false;
+#endif
+}
+
 /* The core: app is an app id (uid % 100000 - 10000), already known to be one.
  */
 static __always_inline u32 policy_lookup_core(uid_t target, u32 app)
@@ -1195,7 +1219,14 @@ static __always_inline u32 policy_lookup_core(uid_t target, u32 app)
 		}
 	}
 
-	repl = (hit | wild) ? (POLICY_REPL_BASE + rk) : 0;
+	/*
+	 * A select, not a branch: the answer steers a register and never the instruction
+	 * stream, so a hidden target and one that was never configured run the same code
+	 * with a different value in one register. Written as a mask because the compiler
+	 * is happy to turn "?:" into a branch here (it did: cbz on hit|wild), and a branch
+	 * on the answer is a branch a predictor can learn and a clock can see.
+	 */
+	repl = (u32)uf_select((u64)(POLICY_REPL_BASE + rk), (u64)0, hit | wild);
 	rcu_read_unlock();
 
 	return repl;

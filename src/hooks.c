@@ -235,6 +235,7 @@ static asmlinkage long __nocfi uid_hook(const struct pt_regs *regs,
 					uidfake_syscall_t orig)
 {
 	struct uidfake_args args;
+	u64 who;
 	u32 repl;
 
 	args.regs[0] = regs->regs[0];
@@ -243,8 +244,14 @@ static asmlinkage long __nocfi uid_hook(const struct pt_regs *regs,
 	if ((u32)regs->regs[0] != which_user)
 		return orig(regs);
 
-	repl = policy_query((u32)regs->regs[ARG_WHO]);
-	args.regs[ARG_WHO] = repl ? (u64)repl : regs->regs[ARG_WHO];
+	/*
+	 * The argument is read and the replacement is selected unconditionally: the same
+	 * instructions either way, so there is no branch for a predictor to learn and no
+	 * difference between a target that is hidden and one that does not exist.
+	 */
+	who = regs->regs[ARG_WHO];
+	repl = policy_query((u32)who);
+	args.regs[ARG_WHO] = uf_select((u64)repl, who, repl);
 	return orig((const struct pt_regs *)&args);
 }
 
