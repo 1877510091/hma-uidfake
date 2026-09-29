@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "sync.hpp"
+#include "status.hpp"
 
 #include "oss_presets.hpp"
 
@@ -12,6 +13,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <utility>
 
 #include "common.hpp"
@@ -24,7 +26,54 @@ namespace {
 /* Where installed code lives; the same root the watcher reports events from. */
 constexpr std::string_view kAppRoot = "/data/app";
 /* The kernel takes this many caller code dirs. */
-constexpr std::size_t kApkLimit = 1024;
+constexpr std::size_t kApkLimit = 10000;
+
+/* One line describing what the kernel says it hooked: what the module
+ * description in the KernelSU or Magisk list shows a user. */
+[[nodiscard]] std::string status_line(NetlinkClient &client,
+                                      std::size_t rules) {
+  const auto st = client.status();
+  std::string line = "ok, " + std::to_string(rules) + " rule(s)";
+
+  if (!st) {
+    line += ", status unavailable";
+    if (client.unsupported())
+      line += " (module older than tool)";
+    return line;
+  }
+  line +=
+      ", uid " + std::to_string(st->native) + "+" + std::to_string(st->compat);
+  if (st->apk_inodes || st->apk_offered)
+    line += ", apk " + std::to_string(st->apk_inodes);
+  if (st->apk_failed)
+    line += " (" + std::to_string(st->apk_failed) + " of " +
+            std::to_string(st->apk_offered) + " failed)";
+  else if (st->apk_failed_total)
+    line += " (" + std::to_string(st->apk_failed_total) + " failed since boot)";
+  /* The geometry the module was built for, against the running kernel's: the
+   * fixmap address and the page tables both follow from it, and the module
+   * proves its writes before making them. Saying which one is in play is what
+   * turns "nothing is hooked" into something a user can act on. */
+  {
+    const auto device = read_device_config();
+
+    if (device.va_bits && st->va_bits && *device.va_bits != st->va_bits)
+      line += ", VA " + std::to_string(*device.va_bits) + " not the module's " +
+              std::to_string(st->va_bits);
+    if (device.page_shift && st->page_shift &&
+        *device.page_shift != st->page_shift)
+      line += ", page size is not the module's";
+  }
+
+  if (st->lsm_state == KAUX_LSM_TAKEN)
+    line +=
+        std::string(", setuid=") + (st->lsm_target[0] ? st->lsm_target : "?");
+  else if (st->lsm_state == KAUX_LSM_FAILED)
+    line += ", setuid hook failed (" + std::to_string(st->lsm_error) + ")";
+  else
+    line += ", setuid hook not installed";
+  return line;
+}
 
 [[nodiscard]] bool dir_matches(std::string_view leaf, std::string_view pkg) {
   return leaf.size() > pkg.size() && leaf.compare(0, pkg.size(), pkg) == 0 &&
@@ -145,6 +194,7 @@ void Syncer::sync_now(std::string_view why) {
     if (!config_refused_) {
       config_refused_ = true;
       Log::warn("no readable rule source yet (keeping the previous policy)");
+      report_status("waiting for an HMA config");
     }
     return;
   }
@@ -218,6 +268,7 @@ void Syncer::sync_now(std::string_view why) {
     }
     pushed_.assign(pairs.begin(), pairs.end());
     Log::info("synced {} pair(s) ({})", pairs.size(), why);
+    report_status(status_line(netlink_, pairs.size()));
   }
 
   std::set<std::uint32_t> caller_uids;
@@ -253,10 +304,10 @@ void Syncer::sync_now(std::string_view why) {
 
 void Syncer::publish_code_dirs() {
   std::vector<ApkEntry> entries;
-  std::size_t outside = 0;
   entries.reserve(callers_.size());
   /* One entry per directory, even when several packages share a uid. */
-  std::set<std::pair<std::uint32_t, std::uint64_t>> seen;
+  /* One entry per apk file, even when several packages share a code dir. */
+  std::set<std::string, std::less<>> seen;
 
   /*
    * Every installed app, not only the callers: the table is what lets the
@@ -295,36 +346,75 @@ void Syncer::publish_code_dirs() {
      * into the kernel's set, and then any file the framework reads from it ends
      * a child's wait long before its own code is anywhere near running.
      */
-    if (!dir->second.lexically_normal().string().starts_with(kAppRoot)) {
-      ++outside;
+    /*
+     * The file a child opens first is its own base.apk, and that is the inode
+     * whose open the kernel replaces, so the path to it is what goes up. A
+     * system app's apk is under /system, an installed one's under /data; both
+     * are files with an inode, and which partition it is on no longer matters.
+     */
+    const auto apk = dir->second / "base.apk";
+    if (!seen.insert(apk.string()).second)
       continue;
-    }
     struct stat info{};
-    if (::stat(dir->second.c_str(), &info) != 0)
-      continue;
-    const auto key = std::pair{static_cast<std::uint32_t>(info.st_dev),
-                               static_cast<std::uint64_t>(info.st_ino)};
-    if (!seen.insert(key).second)
+    if (::stat(apk.c_str(), &info) != 0)
       continue;
     if (entries.size() >= kApkLimit)
       break;
-    entries.push_back(
-        ApkEntry{.dev = key.first, .ino = key.second, .uid = uid});
+    entries.push_back(ApkEntry{.path = apk.string(),
+                               .uid = uid,
+                               .dev = static_cast<std::uint32_t>(info.st_dev),
+                               .ino = static_cast<std::uint64_t>(info.st_ino)});
   }
 
-  const auto same_entry = [](const ApkEntry &a, const ApkEntry &b) {
-    return a.dev == b.dev && a.ino == b.ino && a.uid == b.uid;
+  /*
+   * What goes up is the difference, and only the difference: an apk that is new
+   * or was replaced (same path, another inode -- an update), and one that is
+   * gone (the path is no longer there, so it is named by its numbers). The
+   * whole set would not fit one message on a device with many apps anyway.
+   */
+  /* The difference is taken through hash sets. Both loops below used to scan
+   * the whole published set for every entry -- quadratic, which is a tenth of a
+   * millisecond on a device with three hundred apps and a stall of up to a
+   * second on one at the ten thousand apk limit, on every package event. */
+  const auto key_of = [](const ApkEntry &entry) {
+    return entry.path + '\0' + std::to_string(entry.dev) + '\0' +
+           std::to_string(entry.ino);
   };
-  if (std::ranges::equal(entries, published_, same_entry))
+  std::unordered_set<std::string> known, paths, was_known;
+  known.reserve(entries.size());
+  paths.reserve(entries.size());
+  was_known.reserve(published_.size());
+  for (const auto &entry : entries) {
+    known.insert(key_of(entry));
+    paths.insert(entry.path);
+  }
+  for (const auto &old : published_)
+    was_known.insert(key_of(old));
+
+  std::vector<ApkEntry> delta;
+  for (const auto &entry : entries) {
+    if (!was_known.contains(key_of(entry)))
+      delta.push_back(entry);
+  }
+  for (const auto &old : published_) {
+    if (!paths.contains(old.path))
+      delta.push_back(ApkEntry{.path = old.path,
+                               .uid = old.uid,
+                               .dev = old.dev,
+                               .ino = old.ino,
+                               .action = 1});
+  }
+  Log::info("registered {} app apk(s), {} change(s) to send", entries.size(),
+            delta.size());
+  if (delta.empty())
     return;
-  if (!netlink_.push_apks(entries)) {
+  if (!netlink_.push_apks(delta)) {
     watcher_.arm_retry();
     return;
   }
   published_.assign(entries.begin(), entries.end());
-  if (outside != 0)
-    Log::info("{} code dir(s) outside {} skipped", outside, kAppRoot);
-  Log::info("registered {} caller code dir(s)", entries.size());
+  /* the apk side moved, so the line a user reads has to move with it */
+  report_status(status_line(netlink_, pushed_.size()));
 }
 
 void Syncer::handle_packages(const std::vector<std::string> &dirs) {
@@ -334,8 +424,22 @@ void Syncer::handle_packages(const std::vector<std::string> &dirs) {
   if (callers_.empty())
     return;
 
+  /*
+   * Every install, update and removal changes which base.apk files exist, and
+   * the set of those the kernel holds is what names a child -- so all of these
+   * events have to reach publish_code_dirs(), not only the ones about a caller.
+   * The paths come from the package database, so read it again first: its stamp
+   * is what tells installs apart from noise.
+   */
+  if (this->packages() == nullptr)
+    return;
+
   bool changed = false;
   for (const auto &name : dirs) {
+    /* Every event, including the ones about a package that is not a caller: its
+     * apk still has to be in the kernel's set, so it is worth seeing. */
+    Log::info("package event: {}", name);
+    changed = true;
     const std::filesystem::path base = std::filesystem::path{kAppRoot} / name;
     std::error_code ec;
 

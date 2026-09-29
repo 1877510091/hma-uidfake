@@ -9,15 +9,22 @@
 #include <string_view>
 
 #include "common.hpp"
+#include "kaux.h" /* the wire format, shared with the module */
 
 namespace uidfake {
 
 /* One apk of an app that has rules: the numbers the kernel compares, nothing
  * else. */
 struct ApkEntry {
-  std::uint32_t dev = 0; /* st_dev exactly as stat(2) reported it */
-  std::uint64_t ino = 0;
+  std::string path; /* the app's base.apk, what its children open first */
   std::uint32_t uid = 0;
+  /* st_dev/st_ino as stat(2) reports them: what says the file is the same one,
+   * and what asks for it back when only the numbers are left. */
+  std::uint32_t dev = 0;
+  std::uint64_t ino = 0;
+  /* 1 puts the file back instead of replacing it, so a package change can be
+   * sent as the difference it is. */
+  std::uint32_t action = 0;
 };
 
 /*
@@ -40,31 +47,41 @@ public:
    * Failures are logged; false means the kernel side is not reachable yet. */
   [[nodiscard]] bool push(std::span<const Pair> pairs);
 
+  /* What the module says it hooked, straight from the kernel (KAUX_CMD_STATUS).
+   * Empty when it does not answer, which is what a module that is not loaded
+   * looks like. */
+  [[nodiscard]] std::optional<kaux_status> status();
+  /* True when the kernel refused a command it does not know: the module that is
+   * loaded was built before the command existed. */
+  [[nodiscard]] bool unsupported() const { return unsupported_; }
+
   /* Replaces the kernel's caller-apk inode table (an empty list clears it). */
   [[nodiscard]] bool push_apks(std::span<const ApkEntry> entries);
 
+  /* One staged upload: begin, pages of at most kPageBytes, commit. */
+  [[nodiscard]] bool send_staged(std::uint32_t kind,
+                                 std::span<const std::byte> bytes);
+
 private:
-  static constexpr std::string_view kFamilyName = "kaux";
+  static constexpr std::string_view kFamilyName = KAUX_FAMILY_NAME;
   /* Must match the enum and the version in src/netlink.c. */
-  static constexpr std::uint8_t kCmdSetBegin = 1;
-  static constexpr std::uint8_t kCmdSetPage = 2;
-  static constexpr std::uint8_t kCmdSetCommit = 3;
-  static constexpr std::uint8_t kCmdPing = 4;
-  static constexpr std::uint8_t kCmdApk = 5;
-  static constexpr std::uint8_t kUapiVersion = 2;
-  static constexpr std::uint16_t kAttrBlob = 1;
+  /* The commands, attributes and blob kinds are the shared wire format in
+   * include/kaux.h -- the file the module includes too, so a command that moves
+   * on one side moves on the other or the build stops here. */
   static constexpr std::size_t kReplySize = 4096;
 
   /* One line per outage, and one when it ends. */
   void note_reachable();
   [[nodiscard]] bool ensure_connected();
-  [[nodiscard]] bool send_apks_once(std::span<const ApkEntry> entries);
   [[nodiscard]] bool send_paged(std::span<const Pair> pairs);
   [[nodiscard]] bool send_command(std::uint8_t cmd,
                                   std::span<const std::byte> blob);
   [[nodiscard]] std::optional<std::uint16_t> resolve_family();
   [[nodiscard]] bool exchange(std::span<const std::byte> request,
                               std::span<std::byte> reply);
+  /* Bytes the last exchange received, so a reply can be walked. */
+  std::size_t reply_bytes_ = 0;
+  bool unsupported_ = false;
 
   Fd socket_;
   std::optional<std::uint16_t> family_;

@@ -18,6 +18,7 @@ add_executable(sync-tool
     sync.cpp
     watcher.cpp
     netlink.cpp
+    status.cpp
     rules.cpp
   preset_rules.cpp
     packages.cpp
@@ -45,6 +46,7 @@ if(CMAKE_CROSSCOMPILING)
   file(MAKE_DIRECTORY "${_hdr_root}")
   file(REMOVE_RECURSE "${_hdr_root}/nlohmann")
   file(CREATE_LINK "${_nlj_root}/nlohmann" "${_hdr_root}/nlohmann" SYMBOLIC RESULT _lnk)
-  target_include_directories(sync-tool PRIVATE "${_hdr_root}")
+  target_include_directories(sync-tool PRIVATE "${_hdr_root}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../include")
   message(STATUS "nlohmann/json: header root ${_hdr_root} -> ${_nlj_root}/nlohmann")
 endif()
